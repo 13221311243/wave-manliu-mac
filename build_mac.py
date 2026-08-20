@@ -71,29 +71,48 @@ def build_app(icns):
 
     protected = ["ui", "core", "skills", "edit_studio.py"]
     pack_cmd = " ".join(shlex.quote(a) for a in cmd)
-    pyarmor_cmd = [
-        sys.executable, "-m", "pyarmor", "gen",
-        "--pack", pack_cmd,
-        "-O", os.path.join(BUILD, "pyarmor"),
-        "-r",
-    ] + protected
-    r = subprocess.run(pyarmor_cmd, cwd=ROOT, capture_output=True, text=True)
-    if r.returncode != 0:
-        print("⚠️ PyArmor 加密/打包失败，回退普通 PyInstaller 打包：")
-        print(r.stdout[-3000:])
-        print(r.stderr[-3000:])
+    # PyArmor 9.x：必须用 console script 'pyarmor'（python -m pyarmor 不可用）
+    pyarmor_bin = shutil.which("pyarmor")
+    if not pyarmor_bin:
+        # 兜底：常见安装路径
+        for cand in [os.path.join(os.path.dirname(sys.executable), "pyarmor")]:
+            if os.path.exists(cand):
+                pyarmor_bin = cand
+                break
+    pyarmor_ok = False
+    if not pyarmor_bin:
+        print("⚠️ 未找到 pyarmor 可执行文件，回退普通 PyInstaller 打包")
         r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
         if r.returncode != 0:
             print(r.stdout[-4000:])
             print(r.stderr[-4000:])
             raise SystemExit("PyInstaller 打包失败")
+    else:
+        pyarmor_cmd = [
+            pyarmor_bin, "gen",
+            "--pack", pack_cmd,
+            "-O", os.path.join(BUILD, "pyarmor"),
+            "-r",
+        ] + protected
+        r = subprocess.run(pyarmor_cmd, cwd=ROOT, capture_output=True, text=True)
+        if r.returncode != 0:
+            print("⚠️ PyArmor 加密/打包失败，回退普通 PyInstaller 打包：")
+            print(r.stdout[-3000:])
+            print(r.stderr[-3000:])
+            r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+            if r.returncode != 0:
+                print(r.stdout[-4000:])
+                print(r.stderr[-4000:])
+                raise SystemExit("PyInstaller 打包失败")
+        else:
+            pyarmor_ok = True
     app_dir = os.path.join(DIST, APP_NAME + ".app")
     exe = os.path.join(app_dir, "Contents", "MacOS", APP_NAME)
     if not os.path.isfile(exe):
         # 中文名可执行文件有时为 wave漫流
         entries = os.listdir(os.path.join(app_dir, "Contents", "MacOS"))
         raise SystemExit("可执行文件缺失, MacOS 目录: %s" % entries)
-    print("[2/4] .app 打包完成（PyArmor 已加密）:", app_dir)
+    print("[2/4] .app 打包完成（PyArmor 加密: %s）: %s" % ("✅" if pyarmor_ok else "❌未加密-回退版", app_dir))
     return app_dir
 
 
