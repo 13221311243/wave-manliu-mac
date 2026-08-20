@@ -3,11 +3,12 @@
 
 流程：
 1. 从 app.ico 生成 app.icns（Pillow 渲染多尺寸 PNG + iconutil）
-2. PyInstaller 打包 .app（--windowed，含 tkinter/bg.jpg）
+2. PyArmor 加密核心模块（ui/core/skills/edit_studio）→ --pack 接管 PyInstaller 打包 .app
 3. 校验 .app 结构（可执行文件存在、Info.plist 名字正确）
 4. hdiutil 制作 .dmg
 """
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -48,7 +49,13 @@ def build_icns():
 
 
 def build_app(icns):
-    print("[2/4] PyInstaller 打包 .app ...")
+    """PyArmor 加密核心模块（ui/core/skills/edit_studio）后由 PyArmor --pack 接管 PyInstaller 打包。
+
+    加密范围 = 含 SYSTEM_PROMPT 的 ui.app_ui + 激活校验 license_guard + 全部业务模块。
+    入口 main.py 不加密（启动器）；PyArmor 自动注入运行时并收集加密模块。
+    若 PyArmor 失败则回退普通 PyInstaller 打包（保证出包）。
+    """
+    print("[2/4] PyArmor 加密核心模块 + PyInstaller 打包 .app ...")
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm", "--clean",
@@ -61,18 +68,32 @@ def build_app(icns):
         cmd += ["--icon", icns]
     cmd += ["--add-data", "bg.jpg:.",
             os.path.join(ROOT, "main.py")]
-    r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+
+    protected = ["ui", "core", "skills", "edit_studio.py"]
+    pack_cmd = " ".join(shlex.quote(a) for a in cmd)
+    pyarmor_cmd = [
+        sys.executable, "-m", "pyarmor", "gen",
+        "--pack", pack_cmd,
+        "-O", os.path.join(BUILD, "pyarmor"),
+        "-r",
+    ] + protected
+    r = subprocess.run(pyarmor_cmd, cwd=ROOT, capture_output=True, text=True)
     if r.returncode != 0:
-        print(r.stdout[-4000:])
-        print(r.stderr[-4000:])
-        raise SystemExit("PyInstaller 打包失败")
+        print("⚠️ PyArmor 加密/打包失败，回退普通 PyInstaller 打包：")
+        print(r.stdout[-3000:])
+        print(r.stderr[-3000:])
+        r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+        if r.returncode != 0:
+            print(r.stdout[-4000:])
+            print(r.stderr[-4000:])
+            raise SystemExit("PyInstaller 打包失败")
     app_dir = os.path.join(DIST, APP_NAME + ".app")
     exe = os.path.join(app_dir, "Contents", "MacOS", APP_NAME)
     if not os.path.isfile(exe):
         # 中文名可执行文件有时为 wave漫流
         entries = os.listdir(os.path.join(app_dir, "Contents", "MacOS"))
         raise SystemExit("可执行文件缺失, MacOS 目录: %s" % entries)
-    print("[2/4] .app 打包完成:", app_dir)
+    print("[2/4] .app 打包完成（PyArmor 已加密）:", app_dir)
     return app_dir
 
 

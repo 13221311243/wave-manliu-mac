@@ -4,3 +4,4 @@ Pillow>=10.0
 openai>=1.30
 httpx>=0.27
 pyinstaller>=6.6
+pyarmor>=8.5
