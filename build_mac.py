@@ -48,14 +48,8 @@ def build_icns():
     return icns
 
 
-def build_app(icns):
-    """PyArmor 加密核心模块（ui/core/skills/edit_studio）后由 PyArmor --pack 接管 PyInstaller 打包。
-
-    加密范围 = 含 SYSTEM_PROMPT 的 ui.app_ui + 激活校验 license_guard + 全部业务模块。
-    入口 main.py 不加密（启动器）；PyArmor 自动注入运行时并收集加密模块。
-    若 PyArmor 失败则回退普通 PyInstaller 打包（保证出包）。
-    """
-    print("[2/4] PyArmor 加密核心模块 + PyInstaller 打包 .app ...")
+def _plain_pyinstaller(icns):
+    """普通 PyInstaller 打包（PyArmor 不可用/失败时的回退）"""
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm", "--clean",
@@ -68,44 +62,79 @@ def build_app(icns):
         cmd += ["--icon", icns]
     cmd += ["--add-data", "bg.jpg:.",
             os.path.join(ROOT, "main.py")]
+    return subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
 
-    protected = ["ui", "core", "skills", "edit_studio.py"]
-    pack_cmd = " ".join(shlex.quote(a) for a in cmd)
-    # PyArmor 9.x：必须用 console script 'pyarmor'（python -m pyarmor 不可用）
-    pyarmor_bin = shutil.which("pyarmor")
-    if not pyarmor_bin:
-        # 兜底：常见安装路径
-        for cand in [os.path.join(os.path.dirname(sys.executable), "pyarmor")]:
-            if os.path.exists(cand):
-                pyarmor_bin = cand
-                break
+
+def build_app(icns):
+    """PyArmor 加密核心模块（ui/core/skills/edit_studio）后由 PyArmor --pack 接管 PyInstaller 打包。
+
+    PyArmor 9.x 的 --pack 只接受 spec 文件 / onefile / onedir（不再接受命令字符串），
+    所以先 pyi-makespec 生成 spec，再 pyarmor gen --pack <spec>。
+    加密范围 = 含 SYSTEM_PROMPT 的 ui.app_ui + 激活校验 license_guard + 全部业务模块。
+    入口 main.py 不加密（启动器）；PyArmor 自动注入运行时并收集加密模块。
+    若 PyArmor 失败则回退普通 PyInstaller 打包（保证出包）。
+    """
+    print("[2/4] PyArmor 加密核心模块 + PyInstaller 打包 .app ...")
     pyarmor_ok = False
-    if not pyarmor_bin:
-        print("⚠️ 未找到 pyarmor 可执行文件，回退普通 PyInstaller 打包")
-        r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+
+    # 1. 生成 PyInstaller spec（仅生成 spec，不打壳）
+    spec_file = os.path.join(ROOT, APP_NAME + ".spec")
+    makespec = shutil.which("pyi-makespec") or [
+        sys.executable, "-m", "PyInstaller.utils.makespec"]
+    if isinstance(makespec, str):
+        makespec_cmd = [makespec]
+    else:
+        makespec_cmd = list(makespec)
+    makespec_cmd += ["--windowed", "--name", APP_NAME]
+    if icns:
+        makespec_cmd += ["--icon", icns]
+    makespec_cmd += ["--add-data", "bg.jpg:.", os.path.join(ROOT, "main.py")]
+    r = subprocess.run(makespec_cmd, cwd=ROOT, capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.exists(spec_file):
+        print("⚠️ spec 生成失败，回退普通 PyInstaller 打包：")
+        print(r.stdout[-2000:])
+        print(r.stderr[-2000:])
+        r = _plain_pyinstaller(icns)
         if r.returncode != 0:
             print(r.stdout[-4000:])
             print(r.stderr[-4000:])
             raise SystemExit("PyInstaller 打包失败")
     else:
-        pyarmor_cmd = [
-            pyarmor_bin, "gen",
-            "--pack", pack_cmd,
-            "-O", os.path.join(BUILD, "pyarmor"),
-            "-r",
-        ] + protected
-        r = subprocess.run(pyarmor_cmd, cwd=ROOT, capture_output=True, text=True)
-        if r.returncode != 0:
-            print("⚠️ PyArmor 加密/打包失败，回退普通 PyInstaller 打包：")
-            print(r.stdout[-3000:])
-            print(r.stderr[-3000:])
-            r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+        # 2. PyArmor 加密核心模块并用 spec 打包（PyArmor 9 必须用 console script）
+        pyarmor_bin = shutil.which("pyarmor")
+        if not pyarmor_bin:
+            for cand in [os.path.join(os.path.dirname(sys.executable), "pyarmor")]:
+                if os.path.exists(cand):
+                    pyarmor_bin = cand
+                    break
+        if not pyarmor_bin:
+            print("⚠️ 未找到 pyarmor 可执行文件，回退普通 PyInstaller 打包")
+            r = _plain_pyinstaller(icns)
             if r.returncode != 0:
                 print(r.stdout[-4000:])
                 print(r.stderr[-4000:])
                 raise SystemExit("PyInstaller 打包失败")
         else:
-            pyarmor_ok = True
+            protected = ["ui", "core", "skills", "edit_studio.py"]
+            pyarmor_cmd = [
+                pyarmor_bin, "gen",
+                "--pack", spec_file,
+                "-O", os.path.join(BUILD, "pyarmor"),
+                "-r",
+            ] + protected
+            r = subprocess.run(pyarmor_cmd, cwd=ROOT, capture_output=True, text=True)
+            if r.returncode != 0:
+                print("⚠️ PyArmor 加密/打包失败，回退普通 PyInstaller 打包：")
+                print(r.stdout[-3000:])
+                print(r.stderr[-3000:])
+                r = _plain_pyinstaller(icns)
+                if r.returncode != 0:
+                    print(r.stdout[-4000:])
+                    print(r.stderr[-4000:])
+                    raise SystemExit("PyInstaller 打包失败")
+            else:
+                pyarmor_ok = True
+
     app_dir = os.path.join(DIST, APP_NAME + ".app")
     exe = os.path.join(app_dir, "Contents", "MacOS", APP_NAME)
     if not os.path.isfile(exe):
