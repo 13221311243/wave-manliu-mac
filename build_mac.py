@@ -115,12 +115,26 @@ def build_app(icns):
                 print(r.stderr[-4000:])
                 raise SystemExit("PyInstaller 打包失败")
         else:
-            protected = ["ui", "core", "skills", "edit_studio.py"]
+            protected = [
+                # 敏感常量：SYSTEM_PROMPT 提示词体系 + 题材导演手法库（核心竞争力）
+                "skills/protected_data.py",
+                "skills/protected_genres_a.py",
+                "skills/protected_genres_b.py",
+                # 激活校验 + 核心业务逻辑
+                "skills/license_guard.py",
+                "skills/base_skill.py",
+                "skills/llm_skill.py",
+                "skills/image_skill.py",
+                "skills/video_skill.py",
+                "skills/doc_reader.py",
+                "core/agent.py",
+            ]
+            # 注意：不能 -r 递归（ui/app_ui.py 542KB 和 edit_studio.py 66KB
+            # 超 PyArmor 免费版 ~60KB marshal 单文件限制，会 out of license）
             pyarmor_cmd = [
                 pyarmor_bin, "gen",
                 "--pack", spec_file,
                 "-O", os.path.join(BUILD, "pyarmor"),
-                "-r",
             ] + protected
             r = subprocess.run(pyarmor_cmd, cwd=ROOT, capture_output=True, text=True)
             if r.returncode != 0:
