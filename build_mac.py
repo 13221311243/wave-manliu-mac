@@ -116,6 +116,8 @@ def build_app(icns):
                 raise SystemExit("PyInstaller 打包失败")
         else:
             protected = [
+                # 入口必须加密：PyArmor --pack spec 模式要求 spec 入口脚本也在加密列表中
+                "main.py",
                 # 敏感常量：SYSTEM_PROMPT 提示词体系 + 题材导演手法库（核心竞争力）
                 "skills/protected_data.py",
                 "skills/protected_genres_a.py",
@@ -150,6 +152,9 @@ def build_app(icns):
                 pyarmor_ok = True
 
     app_dir = os.path.join(DIST, APP_NAME + ".app")
+    if not os.path.isdir(app_dir):
+        # PyArmor --pack 会把产物放到 build/pyarmor 下（distpath 被 PyArmor 接管）
+        app_dir = os.path.join(BUILD, "pyarmor", APP_NAME + ".app")
     exe = os.path.join(app_dir, "Contents", "MacOS", APP_NAME)
     if not os.path.isfile(exe):
         # 中文名可执行文件有时为 wave漫流
