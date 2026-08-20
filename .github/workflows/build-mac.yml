@@ -1,0 +1,38 @@
+name: Build macOS DMG
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build DMG
+        run: python build_mac.py
+
+      - name: Verify artifact
+        run: |
+          ls -lh dist/
+          test -f "dist/wave漫流-macOS.dmg"
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: wave漫流-macOS
+          path: dist/wave漫流-macOS.dmg
+          if-no-files-found: error

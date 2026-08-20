@@ -1,0 +1,6 @@
+# macOS 打包依赖
+requests>=2.31
+Pillow>=10.0
+openai>=1.30
+httpx>=0.27
+pyinstaller>=6.6
