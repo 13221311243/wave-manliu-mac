@@ -321,9 +321,20 @@ DIRECTOR_CONTINUITY_RULES = '''【视觉连续性铁律·强制遵守】(保证�
 
 
 
-# ================= 激活（已豁免） =================
+# ================= 激活（强制） =================
 def check_license_on_start():
-    return (True, "验证成功")
+    """启动激活检查（强制）：未激活/过期/机器码不符 → False，由 main() 弹强制激活窗口。
+
+    2026-08-21 修复：此前被误改为直接返回 (True, '验证成功') 豁免——虽然 main() 走 is_activated()
+    未受此影响，但此函数保留豁免是隐患，恢复为真实校验。
+    """
+    try:
+        from skills.license_guard import is_activated
+        if is_activated():
+            return (True, "验证成功")
+        return (False, "软件未激活，请先输入激活码")
+    except Exception:
+        return (False, "激活校验异常，请联系作者")
 
 def update_last_run_time():
     pass
