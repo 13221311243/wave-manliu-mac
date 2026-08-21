@@ -32,6 +32,7 @@ except Exception:
     EditStudio = None
 
 # 2026-08-21 敏感常量从 PyArmor 加密模块导入（SYSTEM_PROMPT/VIDEO_STYLE_PRESETS/GENRE_DIRECTOR_SKILLS）
+# ⚠️ 必须放在所有 try 块之外（曾插入 try 块中间导致 SyntaxError: expected 'except' or 'finally'）
 from skills.protected_data import SYSTEM_PROMPT, VIDEO_STYLE_PRESETS
 from skills.protected_genres_a import GENRE_DIRECTOR_SKILLS as _GDA
 from skills.protected_genres_b import GENRE_DIRECTOR_SKILLS as _GDB
@@ -321,7 +322,7 @@ DIRECTOR_CONTINUITY_RULES = '''【视觉连续性铁律·强制遵守】(保证�
 
 
 
-# ================= 激活（强制） =================
+# ================= 激活（强制，2026-08-21 恢复） =================
 def check_license_on_start():
     """启动激活检查（强制）：未激活/过期/机器码不符 → False，由 main() 弹强制激活窗口。
 
@@ -6918,7 +6919,12 @@ class CineMasterUI:
                 # （修复：此前无此分支，全局规划内容被误塞进上一个 section（道具资产），污染道具资产选项卡）
                 elif ('阶段一' in line and '分镜脚本' in line) or ('全局规划' in line and '分镜' in line):
                     self.current_section = 'global_plan'
-                elif '===== 分镜' in line or 'F. 分镜资产' in line or '阶段二' in line:
+                # 2026-08-21 分镜标题变体兼容：不同 LLM 供应商输出的分镜标题格式不同
+                # （===== 分镜 / 【分镜 N】/ ### 分镜 N / F. 分镜资产 / 阶段二），全部切到 storyboard
+                elif ('===== 分镜' in line or 'F. 分镜资产' in line or '阶段二' in line
+                      or '【分镜' in line or '分镜资产' in line
+                      or re.match(r'^#{0,4}\s*分镜\s*\d+', line.strip())
+                      or re.match(r'^分镜\s*\d+', line.strip())):
                     self.current_section = 'storyboard'
                 elif '剪映专业剪辑指导方案' in line:
                     self.current_section = 'editing'
@@ -7402,6 +7408,25 @@ class CineMasterUI:
                     for _k in ('global_plan', 'storyboard'):
                         try:
                             _sb_content += (self.text_widgets.get(_k).get('1.0', tk.END) or '') + '\n'
+                        except Exception:
+                            pass
+                    # 2026-08-21 兜底：客户环境分镜 tab 为空（LLM 输出分镜标题格式不同导致
+                    # _flush_ui_buffer 分流失败，分镜内容只进 'all' 全文 tab）→ 从 'all' 回退提取分镜段。
+                    # 'all' 是全文展示 tab，永远包含完整分镜内容，不会因分流失败丢失。
+                    if not _sb_content.strip():
+                        try:
+                            _all_text = self.text_widgets.get('all').get('1.0', tk.END) or ''
+                            # 提取 阶段一（分镜脚本）到 剪映方案 之前的分镜内容
+                            _m = re.search(r'(阶段一[：:][^\n]*.*?)(?=\n\s*##?\s*🎬|剪映专业剪辑指导方案|\Z)', _all_text, re.S)
+                            if _m:
+                                _sb_content = _m.group(1)
+                            else:
+                                # 无阶段一标记：取最后一个 ==== 分镜 段起到结尾
+                                _m2 = re.search(r'(=====\s*分镜\s*\d+.*?)(?=剪映专业剪辑指导方案|\Z)', _all_text, re.S)
+                                if _m2:
+                                    _sb_content = _m2.group(1)
+                                else:
+                                    _sb_content = _all_text[-8000:]  # 最后手段：取 all 尾部
                         except Exception:
                             pass
                     _assets_content = ''

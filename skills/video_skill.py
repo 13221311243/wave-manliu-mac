@@ -225,14 +225,14 @@ class VideoSkill(BaseSkill):
     # flux2 首帧参考图数量（角色+场景，最多3张；参考越多越贴近，但可能引入特征混合）
     FRAME_REF_LIMIT = 3
 
-    def execute_generation(self, prompt, api_config, duration, aspect_ratio, resolution, ref_urls):
+    def execute_generation(self, prompt, api_config, duration, aspect_ratio, resolution, ref_urls, local_refs=None):
         if not _is_comfy(api_config):
             raise RuntimeError("当前媒体供应商不是云端 ComfyUI（请将 ComfyUI 供应商设为媒体供应商）")
         base = _comfy_base(api_config)
         if not prompt:
             raise RuntimeError("缺少视频生成提示词")
         # ── 2026-08-06 起视频生成全部走 MiniMax H3（Wan2.2/LTX 分支已注释弃用）──
-        return self._execute_h3(prompt, base, api_config, duration, aspect_ratio, resolution, ref_urls)
+        return self._execute_h3(prompt, base, api_config, duration, aspect_ratio, resolution, ref_urls, local_refs=local_refs)
         # 以下是已弃用的 Wan2.2 流程（保留供参考，不再执行）
         # refs = [u for u in (ref_urls or []) if u][:self.MAX_REFS]
         # if not refs:
@@ -320,7 +320,7 @@ class VideoSkill(BaseSkill):
         #     })
         #     raise
 
-    def _execute_h3(self, prompt, base, api_config, duration, aspect_ratio, resolution, ref_urls):
+    def _execute_h3(self, prompt, base, api_config, duration, aspect_ratio, resolution, ref_urls, local_refs=None):
         """MiniMax H3 多图参考生视频（含原生立体声 + 分镜衔接 + 自定义音色）。
 
         与 Wan2.2 流程区别：
@@ -357,13 +357,25 @@ class VideoSkill(BaseSkill):
             "text": "", "btn_gen_vid": "disabled", "progress": True,
         })
         try:
-            # 1. 下载全部参考图 → base64
+            # 1. 下载全部参考图 → base64（本地文件优先：local_refs[i] 存在则直接读，避免云端 URL 失效）
             b64_list = []
-            for u in refs:
-                r = requests.get(u, timeout=60,
-                                 headers={"User-Agent": "Mozilla/5.0"}, **REQ_KW)
-                r.raise_for_status()
-                b64_list.append(base64.b64encode(r.content).decode())
+            _local_refs = list(local_refs or [])
+            for _ri, u in enumerate(refs):
+                _local_used = False
+                try:
+                    if _ri < len(_local_refs):
+                        _lp = (_local_refs[_ri] or '').strip()
+                        if _lp and os.path.exists(_lp):
+                            with open(_lp, 'rb') as _lf:
+                                b64_list.append(base64.b64encode(_lf.read()).decode())
+                            _local_used = True
+                except Exception:
+                    _local_used = False
+                if not _local_used:
+                    r = requests.get(u, timeout=60,
+                                     headers={"User-Agent": "Mozilla/5.0"}, **REQ_KW)
+                    r.raise_for_status()
+                    b64_list.append(base64.b64encode(r.content).decode())
 
             # 2. 组装 H3 工作流
             wf = json.loads(json.dumps(H3_WORKFLOW_TEMPLATE))
