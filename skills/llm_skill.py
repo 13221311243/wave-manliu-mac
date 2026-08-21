@@ -12,7 +12,10 @@ from skills.base_skill import BaseSkill
 
 
 class LLMSkill(BaseSkill):
-    def execute_generation(self, novel_text, command_text, api_config, system_prompt):
+    def execute_generation(self, novel_text, command_text, api_config, system_prompt,
+                           stop_marker=None, extra_context=''):
+        """生成主调用。stop_marker: 检测到该标记即停止（分段生成用，如 [STAGE1_DONE]）；
+        extra_context: 追加到用户消息的额外上下文（重新生成时携带评级意见）。"""
         current_chunk = ''
         first_chunk_received = False
 
@@ -28,6 +31,8 @@ class LLMSkill(BaseSkill):
         user_prompt = '【小说文本】\n' + novel_text
         if command_text:
             user_prompt += '【附加指令】\n' + command_text + '\n\n'
+        if extra_context:
+            user_prompt += '【本轮生成要求】\n' + extra_context + '\n\n'
 
         messages = [
             {'role': 'system', 'content': system_prompt},
@@ -73,9 +78,17 @@ class LLMSkill(BaseSkill):
                             if not first_chunk_received:
                                 first_chunk_received = True
                                 self.ctx.log('[系统日志] 已收到响应，正在生成内容...\n\n')
+                            # 2026-08-21 修复：每个内容块都必须推送到 UI（此前只在
+                            # [ALL_DONE]/stop_marker 时推送，导致界面看不到任何生成内容）
+                            self.ctx.push_ui_event('stream', {'text': text})
                             if '[ALL_DONE]' in text:
                                 self.ctx.push_ui_event('stream', {'text': text})
+                            elif stop_marker and stop_marker in text:
+                                self.ctx.push_ui_event('stream', {'text': text})
                         stream_closed_normally = True
+                        # 2026-08-21 修复致命死循环：流式正常结束后必须跳出重试循环，
+                        # 否则 retry_count 恒为 0 → while 条件永远满足 → 无限发起新请求
+                        break
                     except Exception as conn_err:
                         err_str = str(conn_err).lower()
                         is_disconnect = ('incomplete chunked read' in err_str
@@ -105,6 +118,12 @@ class LLMSkill(BaseSkill):
                     is_done = True
                     break
 
+                # 2026-08-21 分段生成：检测到阶段停止标记 → 结束本轮（不再自动续写）
+                if stop_marker and stop_marker in chunk_content:
+                    is_done = True
+                    self.ctx.log('\n[系统日志] 检测到阶段标记 %s，本阶段生成完毕。\n' % stop_marker)
+                    break
+
                 if stream_closed_normally and '剪映专业剪辑指导方案' in current_chunk + chunk_content:
                     self.ctx.log('\n[系统日志] 检测到已输出完整剪辑方案，生成完毕。\n')
                     is_done = True
@@ -118,8 +137,9 @@ class LLMSkill(BaseSkill):
                 if chunk_content:
                     current_chunk += chunk_content
                     messages.append({'role': 'assistant', 'content': chunk_content})
+                    _cont_marker = stop_marker if stop_marker else '[ALL_DONE]'
                     messages.append({'role': 'user',
-                                     'content': '请严格接着上次未写完的内容继续输出。如果已全部完毕，请单独输出 [ALL_DONE]'})
+                                     'content': '请严格接着上次未写完的内容继续输出。如果本阶段已全部完毕，请单独输出 %s' % _cont_marker})
                     self.ctx.log('\n\n[系统日志: 内容较长，正在自动续写...]\n\n')
                     # 下一轮 for i 继续
                 else:
@@ -134,6 +154,36 @@ class LLMSkill(BaseSkill):
         self.ctx.push_ui_event('status',
                                {'text': '生成完毕', 'btn_generate': 'normal',
                                 'btn_stop': 'disabled', 'progress': False})
+
+    def execute_review(self, api_config, review_prompt, system_prompt):
+        """2026-08-21 监督层评级调用（非流式，一次性返回评级报告）。
+        返回字符串评级报告，或 None（失败）。"""
+        try:
+            api_key = api_config.get('api_key')
+            base_url = api_config.get('base_url')
+            model_name = api_config.get('model_name')
+
+            timeout_config = httpx.Timeout(60.0, read=120.0)
+            http_client = httpx.Client(timeout=timeout_config, trust_env=False)
+            client = openai.OpenAI(api_key=api_key, base_url=base_url,
+                                   timeout=timeout_config, http_client=http_client)
+
+            messages = [
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': review_prompt},
+            ]
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                stream=False,
+                temperature=0.3,
+            )
+            if resp and resp.choices:
+                return resp.choices[0].message.content or ''
+            return None
+        except Exception as e:
+            self.ctx.log('\n\n[评级失败] 错误信息：' + str(e))
+            return None
 
     def extract_assets(self, full_text):
         """从生成的剧本中提取资产名称和英文提示词"""

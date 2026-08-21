@@ -35,6 +35,57 @@ NEGATIVE_PROMPT = ("(deformed, distorted, disfigured:1.0), poorly drawn, bad ana
                    "3d, cg, render, unreal engine, blender, octane render, illustration, painting, "
                    "anime, cartoon, doll, plastic skin")
 
+# ── 2026-08-21 Qwen-Image（nunchaku fp4）中文生图模型 ──
+# 解决 Flux2 中文文字渲染乱码（公厕/客栈/牌匾等招牌字）。选 comfyui-qwen 模型时走本分支。
+# ✅ 2026-08-21 实例 object_info 实测校准：
+#   - NunchakuQwenImageDiTLoader: model_name（含 QuantFunc/...fp4.safetensors）
+#   - CLIPLoader: type 枚举含 qwen_image；clip_name 含 qwen_image_edit_2511_fp8_e4m3fn.safetensors
+#   - TextEncodeQwenImageEdit: clip/prompt；EmptyQwenImageLayeredLatentImage: width/height/layers/batch_size
+QWEN_UNET = "QuantFunc/nunchaku_qwen_image_2512_best_quality_fp4.safetensors"
+QWEN_CLIP = "qwen_image_edit_2511_fp8_e4m3fn.safetensors"  # CLIPLoader type=qwen_image
+QWEN_VAE = "qwen_image_vae.safetensors"
+QWEN_STEPS = 20
+QWEN_CFG = 4.0
+QWEN_SAMPLER = "euler"
+QWEN_SCHEDULER = "simple"
+QWEN_DENOISE = 1.0
+
+
+def _is_qwen(api_config):
+    """判断当前生图模型是否为 Qwen-Image（comfyui-qwen）"""
+    img_model = (api_config.get("img_model") or "").strip().lower()
+    return img_model.startswith("comfyui-qwen") or img_model.startswith("qwen") or "qwen" in img_model
+
+
+def _build_qwen_workflow(prompt, width, height):
+    """构建 Qwen-Image（nunchaku fp4）文生图工作流（实例实测节点结构，2026-08-21）。
+
+    节点链：NunchakuQwenImageDiTLoader → CLIPLoader(type=qwen_image) → TextEncodeQwenImageEdit×2
+           → EmptyQwenImageLayeredLatentImage → KSampler → VAEDecode → SaveImage。
+    注意：Qwen-Image 分支当前为纯文生图（wave 资产生图/单图均无参考图）；参考图模式暂不接。
+    """
+    w = {
+        "100": {"inputs": {"model_name": QWEN_UNET, "cpu_offload": "auto"},
+                "class_type": "NunchakuQwenImageDiTLoader"},
+        "101": {"inputs": {"clip_name": QWEN_CLIP, "type": "qwen_image", "device": "default"},
+                "class_type": "CLIPLoader"},
+        "102": {"inputs": {"prompt": "", "clip": ["101", 0]}, "class_type": "TextEncodeQwenImageEdit"},
+        "103": {"inputs": {"prompt": "", "clip": ["101", 0]}, "class_type": "TextEncodeQwenImageEdit"},
+        "104": {"inputs": {"width": width, "height": height, "layers": 1, "batch_size": 1},
+                "class_type": "EmptyQwenImageLayeredLatentImage"},
+        "105": {"inputs": {"seed": random.randint(0, 10 ** 18), "steps": QWEN_STEPS, "cfg": QWEN_CFG,
+                           "sampler_name": QWEN_SAMPLER, "scheduler": QWEN_SCHEDULER, "denoise": QWEN_DENOISE,
+                           "model": ["100", 0], "positive": ["102", 0], "negative": ["103", 0],
+                           "latent_image": ["104", 0]}, "class_type": "KSampler"},
+        "106": {"inputs": {"vae_name": QWEN_VAE}, "class_type": "VAELoader"},
+        "107": {"inputs": {"samples": ["105", 0], "vae": ["106", 0]}, "class_type": "VAEDecode"},
+        "108": {"inputs": {"filename_prefix": "ComfyUI", "images": ["107", 0]}, "class_type": "SaveImage"},
+    }
+    w["102"]["inputs"]["prompt"] = prompt
+    w["103"]["inputs"]["prompt"] = NEGATIVE_PROMPT
+    return w
+
+
 # 比例 → 宽高（1K 基准，Flux2-Klein 训练尺寸友好）
 RATIO_MAP = {
     "1:1": (1088, 1088),
@@ -269,9 +320,14 @@ class ImageSkill(BaseSkill):
                 _ratio = str((api_config or {}).get('img_ratio') or '16:9')
                 width, height = RATIO_MAP.get(_ratio, (1280, 720))
                 try:
-                    wf = _build_img_workflow(prompt, width, height, [])
+                    # 2026-08-21 Qwen-Image 分支（选 comfyui-qwen 时）——中文文字渲染不再乱码
+                    _save_node = "108" if _is_qwen(api_config) else "195"
+                    if _is_qwen(api_config):
+                        wf = _build_qwen_workflow(prompt, width, height)
+                    else:
+                        wf = _build_img_workflow(prompt, width, height, [])
                     outputs = _submit_and_wait(base, wf, timeout=600)
-                    url = _output_url(base, outputs, "195")
+                    url = _output_url(base, outputs, _save_node)
                     if not url:
                         raise RuntimeError("未找到输出图片")
                     self.ctx.push_ui_event("image_done", {"name": name, "type": atype, "url": url})
@@ -310,9 +366,14 @@ class ImageSkill(BaseSkill):
             "img_status_text": "ComfyUI 生成中 %s %s" % (ratio, res),
         })
         try:
-            wf = _build_img_workflow(prompt, width, height, [])
+            # 2026-08-21 Qwen-Image 分支（选 comfyui-qwen 时）
+            _save_node = "108" if _is_qwen(api_config) else "195"
+            if _is_qwen(api_config):
+                wf = _build_qwen_workflow(prompt, width, height)
+            else:
+                wf = _build_img_workflow(prompt, width, height, [])
             outputs = _submit_and_wait(base, wf, timeout=600)
-            url = _output_url(base, outputs, "195")
+            url = _output_url(base, outputs, _save_node)
             if not url:
                 raise RuntimeError("未找到输出图片")
             self.ctx.push_ui_event("image_done", {"name": "单图", "type": "image", "url": url})

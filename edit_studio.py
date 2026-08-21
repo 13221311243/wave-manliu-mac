@@ -721,13 +721,6 @@ class EditStudio:
             cands.append(py)
         # 4. 常见安装路径
         cands += [r'C:\ffmpeg\bin\ffmpeg.exe', r'C:\Program Files\ffmpeg\bin\ffmpeg.exe']
-        # macOS（2026-08-20 Mac 移植）：Homebrew/系统路径 + which 兜底
-        if sys.platform == 'darwin':
-            import shutil
-            cands += [r'/opt/homebrew/bin/ffmpeg', r'/usr/local/bin/ffmpeg', r'/usr/bin/ffmpeg']
-            _w = shutil.which('ffmpeg')
-            if _w:
-                cands.append(_w)
         for c in cands:
             if c and os.path.exists(c):
                 return c

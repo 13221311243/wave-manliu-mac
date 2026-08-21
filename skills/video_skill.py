@@ -341,12 +341,17 @@ class VideoSkill(BaseSkill):
         if not refs:
             raise RuntimeError("缺少参考图片（请先生成图片或在历史中选择参考图）")
         prev_video_url = (api_config.get("prev_video_url") or "").strip()
-        # 若有上一镜衔接，参考图留 1 个位置给末帧图（refs 最多 8 张 + 末帧图 = 9 张）
-        if prev_video_url and len(refs) >= H3_MAX_REFS:
+        # 2026-08-21 本地尾帧优先：app_ui 已把上一镜尾帧保存为本地文件并传入 prev_tail_frame，
+        # 云实例重启/URL 失效时仍能衔接（比下载上一镜视频抽帧更稳）。
+        prev_tail_frame = (api_config.get("prev_tail_frame") or "").strip()
+        if prev_tail_frame and not os.path.exists(prev_tail_frame):
+            prev_tail_frame = ""
+        # 若有上一镜衔接（URL 或本地尾帧），参考图留 1 个位置给末帧图（refs 最多 8 张 + 末帧图 = 9 张）
+        if (prev_video_url or prev_tail_frame) and len(refs) >= H3_MAX_REFS:
             refs = refs[:H3_MAX_REFS - 1]
 
         self.ctx.log("\n[系统日志] 正在下载 %d 张参考图并提交 MiniMax H3 视频任务（多图参考+原生立体声）...\n" % len(refs))
-        if prev_video_url:
+        if prev_video_url or prev_tail_frame:
             self.ctx.log("[系统日志] 分镜衔接：只传上一镜最后一帧（首帧衔接，不传音频防台词乱入）\n")
         self.ctx.push_ui_event("status", {
             "text": "", "btn_gen_vid": "disabled", "progress": True,
@@ -377,7 +382,7 @@ class VideoSkill(BaseSkill):
             # 2026-08-15 修复分镜衔接：H3 的 ref_image_0 是首帧锚定槽位。
             #   有上一镜衔接时，ref_image_0 必须留给上一镜末帧图（下一镜从上一镜尾帧开始），
             #   普通参考图从 ref_image_1 开始排；无衔接时普通参考图从 ref_image_0 开始。
-            _ref_offset = 1 if prev_video_url else 0
+            _ref_offset = 1 if (prev_video_url or prev_tail_frame) else 0
             for i, b64 in enumerate(b64_list):
                 key = "ref_images.ref_image_%d" % (i + _ref_offset)
                 wf["%d_ref_%d" % (1000 + _uid, i)] = {
@@ -386,8 +391,25 @@ class VideoSkill(BaseSkill):
                 }
                 wf["136"]["inputs"][key] = ["%d_ref_%d" % (1000 + _uid, i), 0]
 
-            # 2.5 分镜衔接（方案1+方案4）：上一镜视频 → 抽最后一帧作参考图（不传音频、不传视频帧）
-            if prev_video_url:
+            # 2.5 分镜衔接（方案1+方案4）：本地尾帧优先 → 直接进 ref_image_0 首帧锚定槽位；
+            #     无本地尾帧时回退：下载上一镜视频 → 抽最后一帧作参考图（不传音频、不传视频帧）
+            _prev_ok = False
+            if prev_tail_frame:
+                try:
+                    with open(prev_tail_frame, "rb") as _f:
+                        _tb64 = base64.b64encode(_f.read()).decode()
+                    # 本地尾帧图 → ref_images.ref_image_0（首帧锚定槽位！2026-08-15 修复：
+                    # H3 多图参考中 ref_image_0 是首帧，必须让上一镜末帧占首帧位，
+                    # 下一镜才能从上一镜尾帧的姿态/位置开始，否则 H3 自由发挥导致分镜连不上）
+                    wf["154t_%d" % _uid] = {"class_type": "easy loadImageBase64",
+                                            "inputs": {"base64_data": _tb64, "image_output": "Preview",
+                                                       "save_prefix": "ComfyUI"}}
+                    wf["136"]["inputs"]["ref_images.ref_image_0"] = ["154t_%d" % _uid, 0]
+                    _prev_ok = True
+                    self.ctx.log("[系统日志] 上一镜本地尾帧已接入首帧位（ref_images.ref_image_0）\n")
+                except Exception as _te:
+                    self.ctx.log("[系统日志] 本地尾帧接入失败，回退视频抽帧: %s\n" % _te)
+            if not _prev_ok and prev_video_url:
                 try:
                     rv = requests.get(prev_video_url, timeout=90,
                                       headers={"User-Agent": "Mozilla/5.0"}, **REQ_KW)

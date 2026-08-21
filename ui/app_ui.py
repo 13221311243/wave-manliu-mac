@@ -16,33 +16,27 @@ except Exception:
 from PIL import Image, ImageTk
 import io
 
-# ================= macOS 适配（2026-08-20 Mac 移植） =================
-# 数据目录：Mac 上把 cwd 切到 ~/Library/Application Support/WaveManliu，
-# 使 config.json / projects/ / license.json 等相对路径逻辑零改动。
-import sys as _sys
-if _sys.platform == 'darwin':
-    try:
-        _DATA_DIR = os.path.join(os.path.expanduser('~'), 'Library', 'Application Support', 'WaveManliu')
-        os.makedirs(_DATA_DIR, exist_ok=True)
-        os.chdir(_DATA_DIR)
-    except Exception:
-        pass
-# 字体映射：Windows 微软雅黑/Consolas -> macOS PingFang SC/Menlo
-if _sys.platform == 'darwin':
-    _FONT_CN = 'PingFang SC'
-    _FONT_MONO = 'Menlo'
-else:
-    _FONT_CN = '微软雅黑'
-    _FONT_MONO = 'Consolas'
-
 from core.agent import Agent
 from skills.base_skill import AppContext
+
+# 本地控制接口（OpenClaw/QQ 机器人遥控，2026-08-20 新增；缺失时不影响主程序）
+try:
+    from control_server import ControlServer
+except Exception:
+    ControlServer = None
 
 # 剪映式剪辑工作台（三区布局：素材/预览/属性 + 底部时间线）
 try:
     from edit_studio import EditStudio
 except Exception:
     EditStudio = None
+
+# 2026-08-21 敏感常量从 PyArmor 加密模块导入（SYSTEM_PROMPT/VIDEO_STYLE_PRESETS/GENRE_DIRECTOR_SKILLS）
+from skills.protected_data import SYSTEM_PROMPT, VIDEO_STYLE_PRESETS
+from skills.protected_genres_a import GENRE_DIRECTOR_SKILLS as _GDA
+from skills.protected_genres_b import GENRE_DIRECTOR_SKILLS as _GDB
+GENRE_DIRECTOR_SKILLS = dict(_GDA)
+GENRE_DIRECTOR_SKILLS.update(_GDB)
 
 # ================= 常量 =================
 APP_NAME = "wave漫流"
@@ -162,7 +156,7 @@ def apply_ttk_theme():
                   background=[("selected", COLOR_ACCENT)],
                   foreground=[("selected", "white")])
         style.configure("Treeview.Heading", background=COLOR_PANEL, foreground=COLOR_TEXT,
-                        font=(_FONT_CN, 9, "bold"), relief="flat", bordercolor=COLOR_BORDER)
+                        font=("微软雅黑", 9, "bold"), relief="flat", bordercolor=COLOR_BORDER)
         style.map("Treeview.Heading", background=[("active", COLOR_BG)])
         # Scrollbar
         style.configure("Vertical.TScrollbar", background=COLOR_INPUT,
@@ -185,6 +179,7 @@ def apply_ttk_theme():
         return True
     except Exception:
         return False
+# 视频风格预设（全局风格下拉框，放小说文本旁；生成图片/视频/提示词统一遵循）
 DEFAULT_VIDEO_STYLE = '写实电影'
 
 
@@ -236,15 +231,77 @@ def dialect_lang_instruction(lang_name):
         return ""
 
 
-FONT_TITLE = (_FONT_CN, 12, "bold")
-FONT_MAIN = (_FONT_CN, 10)
-FONT_CODE = (_FONT_MONO, 10)
+FONT_TITLE = ("微软雅黑", 12, "bold")
+FONT_MAIN = ("微软雅黑", 10)
+FONT_CODE = ("Consolas", 10)
 
-# 敏感常量（PyArmor 加密模块导入，2026-08-20 拆分）
-from skills.protected_data import SYSTEM_PROMPT, VIDEO_STYLE_PRESETS
-from skills.protected_genres_a import GENRE_DIRECTOR_SKILLS as _GDA
-from skills.protected_genres_b import GENRE_DIRECTOR_SKILLS as _GDB
-GENRE_DIRECTOR_SKILLS = {**_GDA, **_GDB}
+
+# ================= Toonflow 导演技法集成（桌面4文件夹） =================
+# 12 种题材导演手法（源自 Toonflow skill 体系），用于生成分镜时注入题材叙事技法
+# ============ 2026-08-21 监督层评级（Toonflow 评级机制接入）============
+REVIEW_SYSTEM_PROMPT = """你是影视工业化改编项目的**监督层评审专家**。你只对产出物提出问题和建议，**不做任何修改决策，所有修改决定权属于用户**。
+
+# 审核报告格式（必须严格按此结构输出）
+## 总评
+- **评分**：{A/B/C/D}
+- **概要**：{一句话总评，可顺带肯定亮点}
+
+## 问题清单
+| # | 严重程度 | 审核项 | 问题 | 建议方案 |
+|---|----------|--------|------|----------|
+| 1 | 🔴 严重 | {审核项} | {一句话描述} | {建议，多选方案用"/"分隔} |
+| 2 | 🟡 中等 | {审核项} | {一句话描述} | {修复建议} |
+| 3 | ⚪ 轻微 | {审核项} | {一句话描述} | {修复建议} |
+
+# 评分标准
+- A — 可直接使用：0 个严重问题，中等问题 ≤2
+- B — 小修后可用：0 个严重问题，中等问题 ≤5
+- C — 需较大修改：1-2 个严重问题
+- D — 建议重做：≥3 个严重问题
+
+# 精简规则
+- 审核通过的项目不出现在报告中
+- 同类轻微问题合并为一行
+- B 级及以上省略「需要您决定」区块
+
+# 通用审核原则
+1. **可执行优先**：标准是"能不能用"，不是"完不完美"
+2. **问题具体化**：每个问题指向具体位置和内容，不说"整体不够好"
+3. **建议多元化**：严重问题提供多个可选方案
+4. **只提建议不代决策**：所有修改决定权属于用户"""
+
+# 剧本评级审核维度（阶段①）
+REVIEW_SCRIPT_DIMENSIONS = """# 剧本（A基础角色 + B剧本正文）审核维度
+请对以下【剧本产出物】按维度逐项审核，并输出审核报告：
+1. **台词绝对保真**：小说原文对话是否完整保留（不得删减/概括/改写）；是否混入旁白/OS/画外音（本剧禁止）
+2. **分集与时长控制**：台词总字数是否符合目标时长容量（1分钟≈150-200字）；是否超长或过短
+3. **场景切换**：地点/时间变化是否严格切场景；场景描述是否极致简化（禁光影/氛围细致描写）
+4. **角色一致性**：基础角色卡（A段）的形象/性格/服装锚点是否清晰；剧本中角色行为是否符合其性格
+5. **心理活动转化**：内心想法是否转为角色台词（禁止旁白/OS形式）
+6. **开篇吸引力**：第一场是否有强冲突/强情绪；是否踩"铺背景/开会/写景"三天坑
+7. **结构完整**：剧情从小说开头推进，台词完整保留，无遗漏关键事件"""
+
+# 分镜评级审核维度（阶段②：C/D/E资产 + 分镜全局规划 + F分镜资产）
+REVIEW_STORYBOARD_DIMENSIONS = """# 分镜（C/D/E资产 + 分镜全局规划 + F分镜资产）审核维度
+请对以下【分镜产出物】按维度逐项审核，并输出审核报告：
+1. **台词完整性**：分镜台词与剧本一字不差；超长台词是否按 3-4字/秒 拆分（单镜≤10s）
+2. **站位连续性**：同一人物相邻分镜站位/朝向是否一致（严禁左右互换）；换位是否有走位交代
+3. **道具位置连续**：同一道具相邻分镜位置/持有者是否一致；转移是否有动作交代
+4. **资产调用一致**：分镜引用的角色/场景/道具是否与 C/D/E 资产卡对应（不虚构）
+5. **光影连贯**：相邻分镜光影色调是否连贯（无逻辑突变）；是否有过渡标注
+6. **动作物理化**：动作是否为直白物理过程（双脚着地/接触点/受力方向）；无漂浮/瞬移
+7. **H3六段结构**：每个分镜【H3视频提示词】六段是否完整（素材定义/成片目标/不变量锁定/时间轴/环境音配乐/负面约束）；detailed_description 是否写明总时长
+8. **无台词检查**：无台词分镜是否全文无引号对话/可被 H3 念出的句子；是否写"台词：无"
+9. **全局规划与F段一致**：阶段一全局规划是否与 F 段分镜站位/动作/台词一致
+10. **H3 误解风险与方向歧义（2026-08-21 新增，重点审核）**：逐镜检查每个分镜中所有可能让 H3 生成模型产生歧义、矛盾或错误解读的描述，发现任何问题点必须在报告中逐条列出（指出具体分镜号+原文+问题+修正建议）：
+    ① 运镜冲突：同一时间段内既写"固定机位/固定镜头/机位不变"又写推拉摇移等运镜动作（如"固定机位"与"缓推/横移/跟拍"并存），或 summary/retention 写"不推拉不摇移"而 detailed_description 时间轴里出现运镜；
+    ② 方向歧义：人物移动方向/朝向必须以画面坐标明确到底（如"从巷子里走来，往巷子深处走去"——"深处"指画面纵深（背对镜头）还是巷子另一侧？必须写明"向画面深处/背对镜头/向画面左侧巷口"等无歧义表述）；禁止"深处/里面/前方/那边"等无参照方向词；
+    ③ 画面左右 vs 人物朝向混淆：人物站位用"画面左侧/右侧"时，其面朝方向必须与站位、对话对象严格一致且以画面为坐标写明（正确例："A 在画面左侧坐着、面朝画面右侧看向 B；B 在画面右侧坐着、面朝画面左侧看向 A"=两人面对面；错误例："A 在左边坐着看向右侧 B，B 在右边坐着看向左侧"——H3 会把"看向右侧"理解成人物自己朝向的右侧而非画面右侧，导致生成两人背对背或各看各的）；
+    ④ 视线/手势/道具指向歧义：视线落点、手指方向、道具朝向（刀尖/枪口/信纸）必须写明指向画面何处或哪个角色（如"刀尖朝上指向画面右上方"），禁止"指向那边/朝向他"等含糊表述；
+    ⑤ 时间轴动作顺序歧义：同一时间段内多个动作是否明确先后（"先…再…然后…"）；是否出现"同时"与"先后"混用、动作与台词时序矛盾（台词说完前动作已完成）；
+    ⑥ 其他矛盾：同一分镜内互相冲突的约束（正反描述并存，如"缓慢"与"急速"、"安静"与"喧哗"）、同一角色同一镜内位置跳变、可被 H3 多种解读的模糊描述。"""
+
+
 
 # 视觉连续性铁律（源自 Toonflow 分镜表技法：保证相邻分镜衔接不跳画面、不穿帮）
 DIRECTOR_CONTINUITY_RULES = '''【视觉连续性铁律·强制遵守】(保证剪映拼接时相邻镜头不跳画面、不穿帮)
@@ -286,6 +343,14 @@ def load_config():
         "media_api_key": "", "media_base_url": "",
         "img_model": "", "vid_model": "",
         "ui_theme": DEFAULT_THEME,   # 偏好：UI 配色方案
+        # 2026-08-20 AI 遥控配置（客户自填；不填不影响使用）
+        "control_port": 8712,        # 本地控制接口端口（OpenClaw/QQ 机器人调用）
+        "qq_bot": {"appid": "", "appsecret": "", "token": "", "enabled": False},
+        "autodl": {"api_token": "", "instance_id": "", "minimax_key": "", "enabled": False},
+        # 2026-08-21 全局默认供应商配置（配置一次，新建项目自动继承，免重复配置）
+        "global_vendors": None,          # 最近一次保存的供应商列表（含 api_key）
+        "global_text_vendor_id": "",     # 最近一次文本供应商角色
+        "global_media_vendor_id": "",    # 最近一次媒体供应商角色
     }
     if os.path.exists(CONFIG_FILE):
         try:
@@ -314,6 +379,7 @@ DEFAULT_VENDOR_TEMPLATES = [
         "base_url": "http://你的服务器IP:端口", "api_key": "",
         "models": [
             {"name": "comfyui-flux2", "type": "image", "display": "Flux2 生图（需含 flux-2-klein 模型）"},
+            {"name": "comfyui-qwen", "type": "image", "display": "Qwen-Image 生图（中文文字不乱码，需含 nunchaku_qwen_image fp4 模型）"},
             {"name": "comfyui-ltx23", "type": "video", "display": "LTX 2.3 生视频（需含 ltx 模型）"},
             {"name": "comfyui-h3", "type": "video", "display": "MiniMax H3 生视频（多图参考+原生立体声，需含 minimax_h3 模型）"},
         ],
@@ -381,7 +447,12 @@ class CineMasterUI:
             pass
         self.image_history = []
         self.video_history = []
+        self._video_local_paths = {}      # 2026-08-21 视频本地保存路径映射（url → 本地 mp4）
+        self._video_preview_frames = {}   # 2026-08-21 视频预览帧目录映射（url → 帧 PNG 目录）
         self._selected_hist_idx = set()   # 图片历史中选中待删除的索引集合
+        # 2026-08-21 需求2：批量生成按钮锁定时间戳（ComfyUI 卡死时 3 分钟自动恢复）
+        self._btn_lock_times = {}          # {'gen_img': ts, 'gen_vid': ts}
+        self._btn_timeout_seconds = 180    # 3 分钟超时
         self.current_tk_img = None
         self.current_image_url = ""
         self.current_video_url = ""
@@ -410,6 +481,14 @@ class CineMasterUI:
         self._asset_prompt_cn_map = {}
         # 小说转化完成标记（流式 [ALL_DONE] 或 status 生成完毕信号触发，用于自动同步分镜提示词）
         self._story_gen_done = False
+        # 2026-08-21 分段评级状态
+        self._gen_stage = 0              # 当前生成阶段：0无/1剧本/2资产分镜/3剪辑
+        self._gen_novel_text = ''        # 本轮小说文本（阶段间复用）
+        self._gen_command_text = ''      # 本轮附加指令
+        self._gen_system_prompt = ''     # 本轮 system prompt（含风格/导演/地域注入）
+        self._gen_review_text = ''       # 上一轮评级意见（重新生成携带）
+        self._stage_review_done = set()  # 2026-08-21 已触发评级的阶段标记集合（防重复评级）
+        self._pending_stage_after = None # 2026-08-21 挂起的阶段评级 after 回调 id（确认后取消）
         self._asset_photo_refs = {}       # 缩略图 PhotoImage 引用防GC
         self._asset_checked = {}          # {资产名: bool} 勾选状态
         self._regenerating_asset = None   # 正在重新生成的资产名
@@ -476,7 +555,7 @@ class CineMasterUI:
                 sw = tk.Frame(row, width=16, height=16, bg=t[key], highlightbackground=COLOR_BORDER,
                               highlightthickness=1)
                 sw.pack(side="left", padx=2)
-        hint = tk.Label(dlg, text="切换后需重启程序生效", font=(_FONT_CN, 9),
+        hint = tk.Label(dlg, text="切换后需重启程序生效", font=("微软雅黑", 9),
                         fg=COLOR_TEXT_DIM, bg=COLOR_PANEL)
         hint.pack(anchor="w", padx=20, pady=(6, 0))
         def ok():
@@ -519,7 +598,7 @@ class CineMasterUI:
         except Exception:
             pass
         # 标题
-        tk.Label(dlg, text="软件激活", font=(_FONT_CN, 14, "bold"),
+        tk.Label(dlg, text="软件激活", font=("微软雅黑", 14, "bold"),
                  fg=COLOR_ACCENT_DARK, bg=COLOR_PANEL).pack(anchor="w", padx=24, pady=(18, 4))
         # 机器码
         mc = get_machine_code()
@@ -527,7 +606,7 @@ class CineMasterUI:
                  fg=COLOR_TEXT, bg=COLOR_PANEL).pack(anchor="w", padx=24, pady=(8, 2))
         mc_frame = tk.Frame(dlg, bg=COLOR_INPUT, highlightbackground=COLOR_BORDER, highlightthickness=1)
         mc_frame.pack(fill="x", padx=24, pady=(0, 6))
-        tk.Label(mc_frame, text=mc, font=(_FONT_MONO, 11, "bold"),
+        tk.Label(mc_frame, text=mc, font=("Consolas", 11, "bold"),
                  fg=COLOR_ACCENT, bg=COLOR_INPUT).pack(side="left", padx=10, pady=6)
         def _copy_mc():
             try:
@@ -536,17 +615,17 @@ class CineMasterUI:
                 self._show_toast("机器码已复制", "success")
             except Exception:
                 pass
-        tk.Button(mc_frame, text="📋 复制", font=(_FONT_CN, 9),
+        tk.Button(mc_frame, text="📋 复制", font=("微软雅黑", 9),
                   bg=COLOR_ACCENT, fg="white", relief="flat",
                   command=_copy_mc).pack(side="right", padx=8, pady=4)
         # 激活码输入
         tk.Label(dlg, text="激活码：", font=FONT_MAIN, fg=COLOR_TEXT,
                  bg=COLOR_PANEL).pack(anchor="w", padx=24, pady=(8, 2))
-        self.entry_license = tk.Entry(dlg, font=(_FONT_MONO, 11), relief="solid", bd=1,
+        self.entry_license = tk.Entry(dlg, font=("Consolas", 11), relief="solid", bd=1,
                                       bg=COLOR_INPUT, fg=COLOR_TEXT)
         self.entry_license.pack(fill="x", padx=24, pady=(0, 4))
         # 状态
-        self.label_license_status = tk.Label(dlg, text="", font=(_FONT_CN, 9),
+        self.label_license_status = tk.Label(dlg, text="", font=("微软雅黑", 9),
                                              fg=COLOR_DANGER, bg=COLOR_PANEL)
         self.label_license_status.pack(anchor="w", padx=24, pady=(0, 2))
         # 剩余次数
@@ -555,7 +634,7 @@ class CineMasterUI:
             self.label_license_status.config(text="⚠ 已锁定：错误次数过多，请输入正确激活码解锁")
         else:
             tk.Label(dlg, text="剩余尝试次数：%d / %d" % (left, LOCKOUT_AFTER),
-                     font=(_FONT_CN, 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL).pack(anchor="w", padx=24)
+                     font=("微软雅黑", 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL).pack(anchor="w", padx=24)
         # 按钮
         btns = tk.Frame(dlg, bg=COLOR_PANEL)
         btns.pack(fill="x", padx=24, pady=(16, 12))
@@ -624,6 +703,51 @@ class CineMasterUI:
         safe = re.sub(r'[\\/:*?"<>|]', "_", name).strip() or "未命名项目"
         return os.path.join(PROJECTS_DIR, safe + ".json")
 
+    def _assets_dir(self):
+        """2026-08-21 资产图本地目录：projects/<项目名>/assets/"""
+        try:
+            if not self.current_project:
+                return os.path.join(os.getcwd(), "assets")
+            safe = re.sub(r'[\\/:*?"<>|]', "_", (self.current_project.get("name") or "未命名项目")).strip()
+            base = os.path.join(PROJECTS_DIR, safe, "assets")
+            os.makedirs(base, exist_ok=True)
+            return base
+        except Exception:
+            return os.path.join(os.getcwd(), "assets")
+
+    def _tail_frames_dir(self):
+        """2026-08-21 尾帧本地目录：项目目录/assets/tail_frames/"""
+        d = os.path.join(self._assets_dir(), "tail_frames")
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            pass
+        return d
+
+    def _videos_dir(self):
+        """2026-08-21 生成视频本地目录：项目目录/videos/（生成完自动下载保存）"""
+        try:
+            if not self.current_project:
+                return os.path.join(os.getcwd(), "videos")
+            safe = re.sub(r'[\\/:*?"<>|]', "_", (self.current_project.get("name") or "未命名项目")).strip()
+            base = os.path.join(PROJECTS_DIR, safe, "videos")
+            os.makedirs(base, exist_ok=True)
+            return base
+        except Exception:
+            return os.path.join(os.getcwd(), "videos")
+
+    def _preview_frames_dir(self):
+        """2026-08-21 hover 预览帧目录：项目目录/assets/video_previews/（ffmpeg 抽帧存 PNG）"""
+        try:
+            if not self.current_project:
+                return os.path.join(os.getcwd(), "video_previews")
+            safe = re.sub(r'[\\/:*?"<>|]', "_", (self.current_project.get("name") or "未命名项目")).strip()
+            base = os.path.join(PROJECTS_DIR, safe, "assets", "video_previews")
+            os.makedirs(base, exist_ok=True)
+            return base
+        except Exception:
+            return os.path.join(os.getcwd(), "video_previews")
+
     def _list_projects(self):
         if not os.path.exists(PROJECTS_DIR):
             return []
@@ -676,7 +800,7 @@ class CineMasterUI:
                                        values=("中国",), state="readonly",
                                        width=10, font=FONT_MAIN)
         ethnicity_combo.grid(row=2, column=1, padx=12, pady=4, sticky="w")
-        tip = tk.Label(dlg, text="提示：新建项目后将进入配置/控制台工作页", font=(_FONT_CN, 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL)
+        tip = tk.Label(dlg, text="提示：新建项目后将进入配置/控制台工作页", font=("微软雅黑", 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL)
         tip.grid(row=3, column=0, columnspan=2, padx=12, pady=(2, 8), sticky="w")
 
         def on_ok():
@@ -705,14 +829,22 @@ class CineMasterUI:
     def _create_project(self, name, remark, ethnicity="中国"):
         # 2026-08-16 锁死中文：地域强制中国（即使调用方传"海外"也归一）
         ethnicity = "中国"
+        # 2026-08-21 配置一次全局继承：新建项目优先继承 config.json 里的全局默认供应商
+        #（含 api_key/角色），用户配置好一次后，之后所有新项目自动带配置，免重复配置
+        _gv = self.current_config.get("global_vendors")
+        if isinstance(_gv, list) and _gv:
+            _vendors = [json.loads(json.dumps(v)) for v in _gv]
+        else:
+            _vendors = [json.loads(json.dumps(t)) for t in get_vendor_templates()]
         self.current_project = {
             "name": name, "remark": remark,
             "ethnicity": ethnicity,
             "created": time.strftime("%Y-%m-%d %H:%M:%S"),
             "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
             "config": self._get_api_config(),
-            "vendors": [json.loads(json.dumps(t)) for t in get_vendor_templates()],
-            "text_vendor_id": "", "media_vendor_id": "",
+            "vendors": _vendors,
+            "text_vendor_id": self.current_config.get("global_text_vendor_id", ""),
+            "media_vendor_id": self.current_config.get("global_media_vendor_id", ""),
             "novel": "", "command": "",
             "sections": {k: "" for k in ("all", "script", "character", "scene", "prop", "global_plan", "storyboard", "editing")},
             "last_saved_config": self._get_api_config(),
@@ -805,7 +937,7 @@ class CineMasterUI:
             _mark = ' ★当前' if self.current_project and self.current_project.get('name') == _name else ''
             lb.insert(tk.END, "%s    [%s]%s" % (_name, _upd, _mark))
         info = tk.Label(dlg, text="双击打开项目；选中后点「删除所选项目」删除（不可恢复）",
-                        font=(_FONT_CN, 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL)
+                        font=("微软雅黑", 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL)
         info.pack(anchor="w", padx=14)
 
         def _open_selected():
@@ -846,6 +978,8 @@ class CineMasterUI:
                         w.config(state=tk.DISABLED)
                     self.image_history = []
                     self.video_history = []
+                    self._video_local_paths = {}
+                    self._video_preview_frames = {}
                     self.asset_images = {}
                     self.asset_voices = {}
                     self.story_asset_links = []
@@ -894,7 +1028,7 @@ class CineMasterUI:
         lb.bind("<Double-Button-1>", lambda e: open_selected())
         for p in projects:
             lb.insert(tk.END, f"{p.get('name','')}    [{p.get('updated','')}]")
-        info = tk.Label(dlg, text="双击或选中后点击打开；将恢复该项目保存的全部操作状态", font=(_FONT_CN, 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL)
+        info = tk.Label(dlg, text="双击或选中后点击打开；将恢复该项目保存的全部操作状态", font=("微软雅黑", 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL)
         info.pack(anchor="w", padx=14)
 
         def open_selected():
@@ -965,6 +1099,17 @@ class CineMasterUI:
                 w.config(state=tk.DISABLED)
         # 恢复历史
         self.image_history = data.get("image_history", []) or []
+        # 2026-08-21 本地资产恢复：有 local_path 且文件存在 → 直接从本地读图
+        try:
+            for _it in self.image_history:
+                _lp = _it.get("local_path") or ""
+                if _lp and os.path.exists(_lp):
+                    try:
+                        _it['img'] = Image.open(_lp)
+                    except Exception:
+                        _it['img'] = None
+        except Exception:
+            pass
         # 2026-08-09：清洗历史记录里的错乱资产名（旧 extract_assets 正则跨行吞内容，
         # 曾把"贴身宫女（贪嘴丫鬟）=====\n【中文AI提示词】..."整段存成 name）——
         # 含 ===== 或超长换行的 name 截断到标题行为止，保证后续匹配/跳过逻辑干净。
@@ -979,6 +1124,22 @@ class CineMasterUI:
                 else:
                     _it['name'] = _nm[:20]
         self.video_history = data.get("video_history", []) or []
+        # 2026-08-21 恢复视频本地保存路径映射（只保留文件仍存在的；不在 video_history 的清理）
+        try:
+            self._video_local_paths = {}
+            for _vk, _vp in (data.get("video_local_paths") or {}).items():
+                if _vk in self.video_history and _vp and os.path.exists(_vp):
+                    self._video_local_paths[_vk] = _vp
+        except Exception:
+            self._video_local_paths = {}
+        # 2026-08-21 恢复视频预览帧目录映射（只保留目录仍存在的）
+        try:
+            self._video_preview_frames = {}
+            for _vk, _vp in (data.get("video_preview_frames") or {}).items():
+                if _vk in self.video_history and _vp and os.path.isdir(_vp):
+                    self._video_preview_frames[_vk] = _vp
+        except Exception:
+            self._video_preview_frames = {}
         # 重开项目重建中文提示词映射（双击图片预览显示中文；不重建则 prompt_cn 空→回退英文）
         try:
             _full = data.get("sections", {}).get("all", "") or ""
@@ -1049,9 +1210,20 @@ class CineMasterUI:
         # 图片历史只存元信息（PIL Image 无法 JSON 序列化，加载时按 url 重新拉取）
         p["image_history"] = [{'url': it.get('url', ''), 'name': it.get('name', ''),
                                'type': it.get('type', ''), 'chapter': it.get('chapter', ''),
-                               'prompt': it.get('prompt', ''), 'prompt_cn': it.get('prompt_cn', '')}
+                               'prompt': it.get('prompt', ''), 'prompt_cn': it.get('prompt_cn', ''),
+                               'local_path': it.get('local_path', '')}
                               for it in self.image_history]
         p["video_history"] = self.video_history
+        # 2026-08-21 视频本地保存路径映射（url → 本地 mp4 路径），随项目保存
+        try:
+            p["video_local_paths"] = dict(getattr(self, '_video_local_paths', {}) or {})
+        except Exception:
+            p["video_local_paths"] = {}
+        # 2026-08-21 视频预览帧目录映射（url → 帧 PNG 目录），随项目保存
+        try:
+            p["video_preview_frames"] = dict(getattr(self, '_video_preview_frames', {}) or {})
+        except Exception:
+            p["video_preview_frames"] = {}
         # 2026-08-15 需求2：分镜参考图编辑结果（用户手动增删的匹配）随项目保存，重开不丢失
         p["story_asset_links"] = [{'num': ln.get('num', ''), 'assets': list(ln.get('assets', []))}
                                   for ln in getattr(self, 'story_asset_links', [])]
@@ -1065,6 +1237,8 @@ class CineMasterUI:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(p, f, ensure_ascii=False, indent=2)
             os.replace(tmp, path)
+            # 2026-08-21 配置一次全局继承：手动保存时同步全局默认供应商
+            self._sync_global_vendor_defaults()
             self._show_toast("项目已保存", "success")
         except Exception as e:
             messagebox.showerror(APP_NAME, "保存失败：%s" % e)
@@ -1146,14 +1320,14 @@ class CineMasterUI:
             pass
 
     def _build_header(self):
-        tk.Label(self.frame_header, text=APP_NAME, font=(_FONT_CN, 18, "bold"),
+        tk.Label(self.frame_header, text=APP_NAME, font=("微软雅黑", 18, "bold"),
                  fg=COLOR_ACCENT_DARK, bg=COLOR_BG).pack(side="left")
         tk.Label(self.frame_header, text=APP_SUBTITLE, font=FONT_MAIN,
                  fg=COLOR_TEXT_DIM, bg=COLOR_BG).pack(side="left", padx=(8, 0), pady=(7, 0))
 
     def _build_welcome_card(self):
         # 品牌标题（画在背景图上，无图片，文字一排）
-        self.canvas_bg.create_text(30, 26, text=APP_NAME, font=(_FONT_CN, 20, "bold"),
+        self.canvas_bg.create_text(30, 26, text=APP_NAME, font=("微软雅黑", 20, "bold"),
                                    fill=COLOR_ACCENT_DARK, anchor="nw")
         self.canvas_bg.create_text(30 + 24 + len(APP_NAME) * 20, 33, text=APP_SUBTITLE, font=FONT_MAIN,
                                    fill=COLOR_TEXT_DIM, anchor="nw")
@@ -1180,14 +1354,16 @@ class CineMasterUI:
         self.notebook.add(self.frame_console, text="控制台")
         self.notebook.add(self.frame_gen, text="生成器")
         self.notebook.add(self.frame_single, text="单镜工作台")
-        self.notebook.add(self.frame_edit, text="剪辑")
+        # 2026-08-21 剪辑 tab 从 UI 取消（frame_edit 仍构建，代码保留；不再 add 到 notebook）
+        # self.notebook.add(self.frame_edit, text="剪辑")
         self._build_config_area(self.frame_config)
         self._build_console_area(self.frame_console)
         self._build_generator_area(self.frame_gen)
         self._build_single_shot_tab(self.frame_single)
-        self._build_edit_tab(self.frame_edit)
-        # 控制台默认禁用，配置完成后激活
-        self.notebook.tab(2, state="disabled")
+        self._build_edit_tab(self.frame_edit)   # 代码保留，UI 不显示
+        # 2026-08-21 必须先配置供应商：除「配置」外全部 tab 禁用，配置完成后统一激活
+        for _i in range(1, 4):
+            self.notebook.tab(_i, state="disabled")
 
     def _enter_project_page(self):
         # 隐藏背景画布（欢迎页），显示项目页
@@ -1196,12 +1372,96 @@ class CineMasterUI:
         p = self.current_project
         self.label_project_info.config(text=f"项目：{p.get('name','')}    备注：{p.get('remark','')}    创建：{p.get('created','')}")
         self._load_vendor_list()
+        # 2026-08-21 继承的全局配置同步到旧 7 控件（生成链路兜底拿 key），
+        # 否则新项目只解锁不填控件，走旧路径的模块会拿到空 key
+        try:
+            self._sync_compat_from_vendors()
+        except Exception:
+            pass
         self._update_console_state()
 
     # ============ 配置Tab：供应商管理 ============
+    def _on_notebook_tab_changed(self, event=None):
+        """切换 Tab 时：只在配置 Tab 绑滚轮，其他 Tab 解绑（避免滚轮串扰）"""
+        try:
+            sel = self.notebook.index(self.notebook.select()) if self.notebook.select() else 0
+            is_cfg = (sel == 0 and str(self.notebook.tab(0, 'text')) == '配置')
+            # 右侧配置页滚动
+            if hasattr(self, '_cfg_canvas') and hasattr(self, '_cfg_wheel_handler'):
+                if is_cfg:
+                    self._cfg_canvas.bind_all("<MouseWheel>", self._cfg_wheel_handler)
+                else:
+                    try:
+                        self._cfg_canvas.unbind_all("<MouseWheel>")
+                    except Exception:
+                        pass
+            # 2026-08-21 左侧供应商列表滚动（含 AI 遥控）
+            if hasattr(self, '_left_canvas') and hasattr(self, '_left_wheel_handler'):
+                if is_cfg:
+                    # 合并两个 handler：优先滚左侧（鼠标在左列时），否则滚右侧
+                    def _combined(e):
+                        try:
+                            # 判断鼠标位置是否在左列内
+                            mx, my = self.root.winfo_pointerxy()
+                            lx, ly = self._left_canvas.winfo_rootx(), self._left_canvas.winfo_rooty()
+                            lw, lh = self._left_canvas.winfo_width(), self._left_canvas.winfo_height()
+                            if lx <= mx <= lx + lw and ly <= my <= ly + lh:
+                                self._left_wheel_handler(e)
+                            else:
+                                self._cfg_wheel_handler(e)
+                        except Exception:
+                            pass
+                    self._left_canvas.bind_all("<MouseWheel>", _combined)
+                    self._left_canvas.unbind_all("<Shift-MouseWheel>")
+                else:
+                    try:
+                        self._left_canvas.unbind_all("<MouseWheel>")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
     def _build_config_area(self, parent):
-        # 左：供应商列表
-        frame_left = tk.Frame(parent, bg=COLOR_PANEL, width=260)
+        # 2026-08-20 修复：配置页内容超高被窗口裁剪（保存遥控配置按钮看不见）。
+        # 包一层 Canvas 滚动容器：垂直滚动条 + 鼠标滚轮 + 支持触控板/触摸屏。
+        cfg_canvas = tk.Canvas(parent, bg=COLOR_PANEL, highlightthickness=0)
+        cfg_vsb = ttk.Scrollbar(parent, orient="vertical", command=cfg_canvas.yview)
+        cfg_canvas.configure(yscrollcommand=cfg_vsb.set)
+        cfg_canvas.pack(side="left", fill="both", expand=True)
+        cfg_vsb.pack(side="right", fill="y")
+        cfg_inner = tk.Frame(cfg_canvas, bg=COLOR_PANEL)
+        cfg_win = cfg_canvas.create_window((0, 0), window=cfg_inner, anchor="nw")
+
+        def _on_cfg_configure(e):
+            cfg_canvas.configure(scrollregion=cfg_canvas.bbox("all"))
+            # 宽度跟随画布（不出现横向滚动）
+            cfg_canvas.itemconfigure(cfg_win, width=e.width)
+
+        cfg_inner.bind("<Configure>", _on_cfg_configure)
+        cfg_canvas.bind("<Configure>", lambda e: cfg_canvas.itemconfigure(cfg_win, width=e.width))
+
+        def _on_cfg_wheel(e):
+            try:
+                cfg_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+            except Exception:
+                pass
+
+        cfg_canvas.bind_all("<MouseWheel>", _on_cfg_wheel)  # Windows 滚轮
+        # 触控板/触摸屏（macOS/两指滑动）
+        try:
+            cfg_canvas.bind_all("<Shift-MouseWheel>", lambda e: None)
+        except Exception:
+            pass
+
+        # 记住引用，切 Tab 时解绑滚轮，避免影响其他 Tab
+        self._cfg_canvas = cfg_canvas
+        self._cfg_wheel_handler = _on_cfg_wheel
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
+
+        # 所有配置内容都挂到 cfg_inner（原 parent）上
+        parent = cfg_inner
+        # 左：供应商列表（含固定条目「AI 遥控」）
+        frame_left = tk.Frame(parent, bg=COLOR_PANEL, width=240)
         frame_left.pack(side="left", fill="y", padx=(14, 8), pady=14)
         frame_left.pack_propagate(False)
         tk.Label(frame_left, text="供应商列表", font=FONT_TITLE, bg=COLOR_PANEL, fg=COLOR_TEXT).pack(anchor="w", pady=(0, 6))
@@ -1210,12 +1470,11 @@ class CineMasterUI:
                                          bg=COLOR_INPUT, fg=COLOR_TEXT, selectforeground="white")
         self.vendor_listbox.pack(fill="both", expand=True)
         self.vendor_listbox.bind("<<ListboxSelect>>", self._on_vendor_select)
-        # 添加供应商（3 种方式）
-        tk.Label(frame_left, text="添加供应商：", font=(_FONT_CN, 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL).pack(anchor="w", pady=(10, 2))
+        tk.Label(frame_left, text="添加供应商：", font=("微软雅黑", 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL).pack(anchor="w", pady=(10, 2))
         btn_row = tk.Frame(frame_left, bg=COLOR_PANEL)
         btn_row.pack(fill="x")
         def _mk_btn(txt, cmd):
-            b = tk.Button(btn_row, text=txt, font=(_FONT_CN, 9), bg=COLOR_PANEL, fg=COLOR_ACCENT,
+            b = tk.Button(btn_row, text=txt, font=("微软雅黑", 9), bg=COLOR_PANEL, fg=COLOR_ACCENT,
                           relief="solid", bd=1, highlightbackground=COLOR_BORDER, command=cmd)
             b.pack(side="left", fill="x", expand=True, padx=(0, 4))
             return b
@@ -1224,17 +1483,22 @@ class CineMasterUI:
         _mk_btn("文件", self._add_vendor_from_file)
         btn_row2 = tk.Frame(frame_left, bg=COLOR_PANEL)
         btn_row2.pack(fill="x", pady=(6, 0))
-        b_del = tk.Button(btn_row2, text="删除选中供应商", font=(_FONT_CN, 9), bg=COLOR_DANGER, fg="white",
+        b_del = tk.Button(btn_row2, text="删除选中供应商", font=("微软雅黑", 9), bg=COLOR_DANGER, fg="white",
                           relief="flat", command=self._delete_vendor)
         b_del.pack(side="left", fill="x", expand=True, padx=(0, 4))
         bind_hover(b_del, COLOR_DANGER, "#CC2B22")
 
-        # 右：供应商详情
+        # 右：供应商详情 / AI 遥控面板（2026-08-21 双面板切换）
         frame_right = tk.Frame(parent, bg=COLOR_PANEL)
         frame_right.pack(side="left", fill="both", expand=True, padx=(8, 14), pady=14)
+        self._vendor_panel = tk.Frame(frame_right, bg=COLOR_PANEL)
+        self._vendor_panel.pack(fill="both", expand=True)
+        self._remote_panel = tk.Frame(frame_right, bg=COLOR_PANEL)
+        # 遥控面板默认隐藏，选中「AI 遥控」条目时显示
+        self._remote_panel.pack_forget()
         self.vendor_detail = {}
-        tk.Label(frame_right, text="供应商详情", font=FONT_TITLE, bg=COLOR_PANEL, fg=COLOR_TEXT).pack(anchor="w", pady=(0, 6))
-        g = tk.Frame(frame_right, bg=COLOR_PANEL)
+        tk.Label(self._vendor_panel, text="供应商详情", font=FONT_TITLE, bg=COLOR_PANEL, fg=COLOR_TEXT).pack(anchor="w", pady=(0, 6))
+        g = tk.Frame(self._vendor_panel, bg=COLOR_PANEL)
         g.pack(fill="x")
         g.columnconfigure(1, weight=1)
         tk.Label(g, text="名称：", font=FONT_MAIN, bg=COLOR_PANEL, fg=COLOR_TEXT).grid(row=0, column=0, sticky="w", padx=(0, 8), pady=4)
@@ -1252,7 +1516,7 @@ class CineMasterUI:
         self.vendor_detail["api_key"].grid(row=2, column=1, sticky="ew", pady=4)
         self.vendor_detail["api_key"].bind("<KeyRelease>", self._on_vendor_field_edit)
         self.vendor_detail["api_key"].bind("<FocusOut>", self._on_vendor_field_edit)
-        btn_showkey = tk.Button(g, text="显示", font=(_FONT_CN, 9), bg=COLOR_PANEL, fg=COLOR_TEXT_DIM,
+        btn_showkey = tk.Button(g, text="显示", font=("微软雅黑", 9), bg=COLOR_PANEL, fg=COLOR_TEXT_DIM,
                                 relief="solid", bd=1, highlightbackground=COLOR_BORDER,
                                 command=self._toggle_vendor_key_show)
         btn_showkey.grid(row=2, column=2, padx=(6, 0))
@@ -1262,8 +1526,8 @@ class CineMasterUI:
         self.vendor_detail["role"].grid(row=3, column=1, sticky="w", pady=4)
 
         # 模型列表
-        tk.Label(frame_right, text="模型列表（该供应商提供的模型）", font=FONT_TITLE, bg=COLOR_PANEL, fg=COLOR_TEXT).pack(anchor="w", pady=(12, 6))
-        tv_frame = tk.Frame(frame_right, bg=COLOR_PANEL)
+        tk.Label(self._vendor_panel, text="模型列表（该供应商提供的模型）", font=FONT_TITLE, bg=COLOR_PANEL, fg=COLOR_TEXT).pack(anchor="w", pady=(12, 6))
+        tv_frame = tk.Frame(self._vendor_panel, bg=COLOR_PANEL)
         tv_frame.pack(fill="both", expand=True)
         self.vendor_tree = ttk.Treeview(tv_frame, columns=("type", "name", "display"), show="headings", height=6)
         self.vendor_tree.heading("type", text="类型")
@@ -1279,7 +1543,7 @@ class CineMasterUI:
         self.vendor_tree.bind("<Double-1>", self._on_model_double_click)
 
         # 底部操作区
-        bottom = tk.Frame(frame_right, bg=COLOR_PANEL)
+        bottom = tk.Frame(self._vendor_panel, bg=COLOR_PANEL)
         bottom.pack(fill="x", pady=(10, 0))
         btn_add_model = tk.Button(bottom, text="＋ 添加模型", font=FONT_MAIN, bg=COLOR_PANEL, fg=COLOR_ACCENT,
                                   relief="solid", bd=1, highlightbackground=COLOR_BORDER, command=self._add_model_dialog)
@@ -1302,17 +1566,179 @@ class CineMasterUI:
                                    relief="flat", command=lambda: self._set_vendor_role("media"))
         btn_role_media.pack(side="right")
         bind_hover(btn_role_media, COLOR_ACCENT_DARK, "#00449B")
-        tk.Label(frame_right, text="提示：文本供应商负责小说→剧本/分镜的 LLM 生成；媒体供应商负责图片/视频生成。\n设为文本/媒体供应商后即映射到控制台使用的模型配置，配置完成即可激活控制台。",
-                 font=(_FONT_CN, 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL).pack(anchor="w", pady=(8, 0))
+        tk.Label(self._vendor_panel, text="提示：文本供应商负责小说→剧本/分镜的 LLM 生成；媒体供应商负责图片/视频生成。\n设为文本/媒体供应商后即映射到控制台使用的模型配置，配置完成即可激活控制台。",
+                 font=("微软雅黑", 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL).pack(anchor="w", pady=(8, 0))
 
         # ===== 兼容层（7 个核心控件，供 _get_api_config 等旧逻辑使用）=====
-        self.entry_api_key = tk.Entry(frame_right, bg=COLOR_INPUT, fg=COLOR_TEXT, insertbackground=COLOR_TEXT)
-        self.entry_base_url = tk.Entry(frame_right, bg=COLOR_INPUT, fg=COLOR_TEXT, insertbackground=COLOR_TEXT)
-        self.combo_text_model = ttk.Combobox(frame_right, width=18, font=FONT_MAIN)
-        self.entry_media_api_key = tk.Entry(frame_right, bg=COLOR_INPUT, fg=COLOR_TEXT, insertbackground=COLOR_TEXT)
-        self.entry_media_base_url = tk.Entry(frame_right, bg=COLOR_INPUT, fg=COLOR_TEXT, insertbackground=COLOR_TEXT)
-        self.combo_img_model = ttk.Combobox(frame_right, width=18, font=FONT_MAIN)
-        self.combo_vid_model = ttk.Combobox(frame_right, width=18, font=FONT_MAIN)
+        self.entry_api_key = tk.Entry(self._vendor_panel, bg=COLOR_INPUT, fg=COLOR_TEXT, insertbackground=COLOR_TEXT)
+        self.entry_base_url = tk.Entry(self._vendor_panel, bg=COLOR_INPUT, fg=COLOR_TEXT, insertbackground=COLOR_TEXT)
+        self.combo_text_model = ttk.Combobox(self._vendor_panel, width=18, font=FONT_MAIN)
+        self.entry_media_api_key = tk.Entry(self._vendor_panel, bg=COLOR_INPUT, fg=COLOR_TEXT, insertbackground=COLOR_TEXT)
+        self.entry_media_base_url = tk.Entry(self._vendor_panel, bg=COLOR_INPUT, fg=COLOR_TEXT, insertbackground=COLOR_TEXT)
+        self.combo_img_model = ttk.Combobox(self._vendor_panel, width=18, font=FONT_MAIN)
+        self.combo_vid_model = ttk.Combobox(self._vendor_panel, width=18, font=FONT_MAIN)
+
+        # ===== AI 遥控面板（2026-08-21 作为列表「AI 遥控」条目的右侧详情）=====
+        self._build_remote_panel(self._remote_panel)
+
+    # ============ AI 遥控配置 UI（QQ 机器人 + AutoDL，2026-08-21 作为列表「AI 遥控」条目右侧详情）============
+    def _build_remote_panel(self, parent):
+        """AI 遥控配置面板：选中左侧列表「AI 遥控」条目时在右侧显示"""
+        tk.Label(parent, text="🎛 AI 遥控配置（QQ 机器人 + AutoDL 开关；选填，不填不影响 wave漫流 使用）",
+                 font=("微软雅黑", 11, "bold"), fg=COLOR_ACCENT_DARK, bg=COLOR_PANEL).pack(anchor="w", pady=(0, 6))
+        rc = tk.Frame(parent, bg=COLOR_PANEL)
+        rc.pack(fill="x", pady=(4, 0))
+        rc.columnconfigure(1, weight=1)
+
+        tk.Label(rc, text="QQ 机器人（在 q.qq.com 注册后填写，用于手机 QQ 遥控）：",
+                 font=("微软雅黑", 9, "bold"), fg=COLOR_TEXT, bg=COLOR_PANEL
+                 ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(6, 2))
+        tk.Label(rc, text="AppID：", font=FONT_MAIN, bg=COLOR_PANEL, fg=COLOR_TEXT
+                 ).grid(row=1, column=0, sticky="w", padx=(0, 8), pady=3)
+        self.qq_appid = tk.Entry(rc, font=FONT_MAIN, relief="solid", bd=1,
+                                 bg=COLOR_INPUT, fg=COLOR_TEXT, insertbackground=COLOR_TEXT)
+        self.qq_appid.grid(row=1, column=1, sticky="ew", pady=3)
+        tk.Label(rc, text="AppSecret：", font=FONT_MAIN, bg=COLOR_PANEL, fg=COLOR_TEXT
+                 ).grid(row=2, column=0, sticky="w", padx=(0, 8), pady=3)
+        self.qq_appsecret = tk.Entry(rc, font=FONT_MAIN, relief="solid", bd=1, show="*",
+                                     bg=COLOR_INPUT, fg=COLOR_TEXT, insertbackground=COLOR_TEXT)
+        self.qq_appsecret.grid(row=2, column=1, sticky="ew", pady=3)
+        tk.Label(rc, text="Token：", font=FONT_MAIN, bg=COLOR_PANEL, fg=COLOR_TEXT
+                 ).grid(row=3, column=0, sticky="w", padx=(0, 8), pady=3)
+        self.qq_token = tk.Entry(rc, font=FONT_MAIN, relief="solid", bd=1, show="*",
+                                 bg=COLOR_INPUT, fg=COLOR_TEXT, insertbackground=COLOR_TEXT)
+        self.qq_token.grid(row=3, column=1, sticky="ew", pady=3)
+        self.qq_enabled = tk.BooleanVar(value=False)
+        tk.Checkbutton(rc, text="启用 QQ 对话", variable=self.qq_enabled, font=FONT_MAIN,
+                       bg=COLOR_PANEL, fg=COLOR_TEXT, selectcolor=COLOR_INPUT,
+                       activebackground=COLOR_PANEL, activeforeground=COLOR_TEXT
+                       ).grid(row=4, column=0, sticky="w", pady=(4, 2))
+
+        # AI 助手大脑（MiniMax API Key，客户自填；OpenClaw 智能对话用，不填则 QQ 遥控走固定指令路由）
+        tk.Label(rc, text="AI 助手大脑（MiniMax API Key，在 platform.minimaxi.com 获取；OpenClaw 智能对话用）：",
+                 font=("微软雅黑", 9, "bold"), fg=COLOR_TEXT, bg=COLOR_PANEL
+                 ).grid(row=4, column=1, columnspan=2, sticky="w", pady=(12, 2))
+        tk.Label(rc, text="MiniMax Key：", font=FONT_MAIN, bg=COLOR_PANEL, fg=COLOR_TEXT
+                 ).grid(row=5, column=0, sticky="w", padx=(0, 8), pady=3)
+        self.minimax_key = tk.Entry(rc, font=FONT_MAIN, relief="solid", bd=1, show="*",
+                                    bg=COLOR_INPUT, fg=COLOR_TEXT, insertbackground=COLOR_TEXT)
+        self.minimax_key.grid(row=5, column=1, sticky="ew", pady=3)
+
+        tk.Label(rc, text="AutoDL 实例（可选，QQ 远程开关你的 GPU 实例）：",
+                 font=("微软雅黑", 9, "bold"), fg=COLOR_TEXT, bg=COLOR_PANEL
+                 ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(12, 2))
+        tk.Label(rc, text="API Token：", font=FONT_MAIN, bg=COLOR_PANEL, fg=COLOR_TEXT
+                 ).grid(row=7, column=0, sticky="w", padx=(0, 8), pady=3)
+        self.adl_token = tk.Entry(rc, font=FONT_MAIN, relief="solid", bd=1, show="*",
+                                  bg=COLOR_INPUT, fg=COLOR_TEXT, insertbackground=COLOR_TEXT)
+        self.adl_token.grid(row=7, column=1, sticky="ew", pady=3)
+        tk.Label(rc, text="实例 ID：", font=FONT_MAIN, bg=COLOR_PANEL, fg=COLOR_TEXT
+                 ).grid(row=8, column=0, sticky="w", padx=(0, 8), pady=3)
+        self.adl_instance = tk.Entry(rc, font=FONT_MAIN, relief="solid", bd=1,
+                                     bg=COLOR_INPUT, fg=COLOR_TEXT, insertbackground=COLOR_TEXT)
+        self.adl_instance.grid(row=8, column=1, sticky="ew", pady=3)
+        self.adl_enabled = tk.BooleanVar(value=False)
+        tk.Checkbutton(rc, text="启用 AutoDL 开关", variable=self.adl_enabled, font=FONT_MAIN,
+                       bg=COLOR_PANEL, fg=COLOR_TEXT, selectcolor=COLOR_INPUT,
+                       activebackground=COLOR_PANEL, activeforeground=COLOR_TEXT
+                       ).grid(row=9, column=0, sticky="w", pady=(4, 2))
+
+        btn_row = tk.Frame(rc, bg=COLOR_PANEL)
+        btn_row.grid(row=10, column=0, columnspan=3, sticky="w", pady=(8, 2))
+        btn_save_rc = tk.Button(btn_row, text="💾 保存遥控配置", font=FONT_MAIN,
+                                bg=COLOR_ACCENT, fg="white", relief="flat",
+                                command=self._save_remote_config)
+        btn_save_rc.pack(side="left", padx=(0, 8))
+        bind_hover(btn_save_rc, COLOR_ACCENT, COLOR_ACCENT_DARK)
+        btn_test_qq = tk.Button(btn_row, text="测试 QQ 连接", font=FONT_MAIN,
+                                bg=COLOR_PANEL, fg=COLOR_ACCENT, relief="solid", bd=1,
+                                highlightbackground=COLOR_BORDER, command=self._test_qq_config)
+        btn_test_qq.pack(side="left", padx=(0, 8))
+        btn_test_adl = tk.Button(btn_row, text="测试 AutoDL", font=FONT_MAIN,
+                                 bg=COLOR_PANEL, fg=COLOR_ACCENT, relief="solid", bd=1,
+                                 highlightbackground=COLOR_BORDER, command=self._test_autodl_config)
+        btn_test_adl.pack(side="left")
+        self.lbl_rc_status = tk.Label(rc, text="", font=("微软雅黑", 9), fg=COLOR_SUCCESS, bg=COLOR_PANEL)
+        self.lbl_rc_status.grid(row=10, column=0, columnspan=3, sticky="w", pady=(2, 4))
+
+        self._load_remote_config()
+
+    # ============ AI 遥控配置逻辑（QQ 机器人 + AutoDL）============
+    def _load_remote_config(self):
+        """从 config.json（self.current_config）回填遥控配置"""
+        try:
+            cfg = self.current_config or {}
+            qq = cfg.get("qq_bot", {}) or {}
+            adl = cfg.get("autodl", {}) or {}
+            self.qq_appid.delete(0, tk.END)
+            self.qq_appid.insert(0, qq.get("appid", ""))
+            self.qq_appsecret.delete(0, tk.END)
+            self.qq_appsecret.insert(0, qq.get("appsecret", ""))
+            self.qq_token.delete(0, tk.END)
+            self.qq_token.insert(0, qq.get("token", ""))
+            self.qq_enabled.set(bool(qq.get("enabled", False)))
+            self.minimax_key.delete(0, tk.END)
+            self.minimax_key.insert(0, adl.get("minimax_key", ""))
+            self.adl_token.delete(0, tk.END)
+            self.adl_token.insert(0, adl.get("api_token", ""))
+            self.adl_instance.delete(0, tk.END)
+            self.adl_instance.insert(0, adl.get("instance_id", ""))
+            self.adl_enabled.set(bool(adl.get("enabled", False)))
+        except Exception:
+            pass
+
+    def _save_remote_config(self):
+        try:
+            cfg = self.current_config or {}
+            cfg["qq_bot"] = {
+                "appid": self.qq_appid.get().strip(),
+                "appsecret": self.qq_appsecret.get().strip(),
+                "token": self.qq_token.get().strip(),
+                "enabled": bool(self.qq_enabled.get()),
+            }
+            cfg["autodl"] = {
+                "minimax_key": self.minimax_key.get().strip(),
+                "api_token": self.adl_token.get().strip(),
+                "instance_id": self.adl_instance.get().strip(),
+                "enabled": bool(self.adl_enabled.get()),
+            }
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            self.lbl_rc_status.config(text="✔ 遥控配置已保存", fg=COLOR_SUCCESS)
+            self._show_toast("遥控配置已保存", "success")
+        except Exception as e:
+            self.lbl_rc_status.config(text="保存失败: %s" % e, fg=COLOR_DANGER)
+
+    def _test_qq_config(self):
+        appid = self.qq_appid.get().strip()
+        appsecret = self.qq_appsecret.get().strip()
+        # token 仅 Webhook 模式用；WebSocket 模式只需 AppID+AppSecret，token 可留空
+        if not appid or not appsecret:
+            self.lbl_rc_status.config(text="QQ 配置不完整：AppID/AppSecret 必填（Token 可留空）", fg=COLOR_DANGER)
+            return
+        # 本地无法真正连 QQ（需 botpy + 网络），只做格式校验 + 提示
+        self.lbl_rc_status.config(
+            text="QQ 配置已填（AppID=%s）。保存后重启软件，启用 QQ 对话将自动拉起机器人。" % appid,
+            fg=COLOR_SUCCESS)
+
+    def _test_autodl_config(self):
+        token = self.adl_token.get().strip()
+        inst = self.adl_instance.get().strip()
+        if not token:
+            self.lbl_rc_status.config(text="AutoDL API Token 未填", fg=COLOR_DANGER)
+            return
+        if not inst:
+            self.lbl_rc_status.config(text="AutoDL 实例 ID 未填", fg=COLOR_DANGER)
+            return
+        try:
+            from autodl_control import query_instance_status
+            result = query_instance_status(token, inst)
+            if result.get("ok"):
+                self.lbl_rc_status.config(text="AutoDL 连接成功：实例 %s 状态=%s" % (inst, result.get("status", "?")), fg=COLOR_SUCCESS)
+            else:
+                self.lbl_rc_status.config(text="AutoDL 连接失败：%s" % result.get("error", "未知错误"), fg=COLOR_DANGER)
+        except Exception as e:
+            self.lbl_rc_status.config(text="AutoDL 测试异常: %s" % e, fg=COLOR_DANGER)
 
 
 
@@ -1329,19 +1755,36 @@ class CineMasterUI:
                 self.vendor_listbox.itemconfig(i, fg=COLOR_SUCCESS)
             elif self.current_project.get("media_vendor_id") == v.get("id"):
                 self.vendor_listbox.itemconfig(i, fg=COLOR_ACCENT)
+        # 2026-08-21 固定条目「AI 遥控」：像供应商一样可点，选中后右侧显示遥控配置
+        _ai_idx = self.vendor_listbox.size()
+        self.vendor_listbox.insert(tk.END, "🎛 AI 遥控")
+        self.vendor_listbox.itemconfig(_ai_idx, fg=COLOR_ACCENT_DARK)
         if self.vendor_listbox.size() > 0:
             self.vendor_listbox.selection_set(0)
             self._on_vendor_select()
 
+    def _is_ai_remote_item(self, idx):
+        """判断列表索引是否指向固定条目「AI 遥控」（在 vendors 之后）"""
+        try:
+            return idx >= len(self._current_vendors())
+        except Exception:
+            return False
+
     def _on_vendor_select(self, event=None):
         sel = self.vendor_listbox.curselection()
         if not sel:
+            return
+        # 2026-08-21 AI 遥控条目：右侧显示遥控配置面板
+        if self._is_ai_remote_item(sel[0]):
+            self._selected_vendor_idx = sel[0]
+            self._show_remote_panel()
             return
         vendors = self._current_vendors()
         if sel[0] >= len(vendors):
             return
         self._selected_vendor_idx = sel[0]
         v = vendors[sel[0]]
+        self._show_vendor_panel()
         self.vendor_detail["name"].delete(0, tk.END)
         self.vendor_detail["name"].insert(0, v.get("name", ""))
         self.vendor_detail["base_url"].delete(0, tk.END)
@@ -1360,6 +1803,24 @@ class CineMasterUI:
         for m in v.get("models", []):
             self.vendor_tree.insert("", tk.END, values=(m.get("type", ""), m.get("name", ""), m.get("display", "")))
 
+    def _show_vendor_panel(self):
+        """2026-08-21 右侧显示供应商详情面板（隐藏 AI 遥控面板）"""
+        try:
+            self._remote_panel.pack_forget()
+            self._vendor_panel.pack(fill="both", expand=True)
+        except Exception:
+            pass
+
+    def _show_remote_panel(self):
+        """2026-08-21 右侧显示 AI 遥控配置面板（隐藏供应商详情面板）"""
+        try:
+            self._vendor_panel.pack_forget()
+            self._remote_panel.pack(fill="both", expand=True)
+            # 回填最新配置（确保显示的是保存过的值）
+            self._load_remote_config()
+        except Exception:
+            pass
+
     def _apply_vendor_edits(self, idx=None):
         """把右侧详情写回供应商对象"""
         vendors = self._current_vendors()
@@ -1368,6 +1829,9 @@ class CineMasterUI:
             if not sel or sel[0] >= len(vendors):
                 return
             idx = sel[0]
+        # 2026-08-21 防止 AI 遥控条目越界
+        if idx >= len(vendors):
+            return
         v = vendors[idx]
         v["name"] = self.vendor_detail["name"].get().strip() or v.get("name", "未命名")
         v["base_url"] = self.vendor_detail["base_url"].get().strip()
@@ -1406,6 +1870,24 @@ class CineMasterUI:
         except Exception:
             pass
 
+    def _sync_global_vendor_defaults(self):
+        """2026-08-21 配置一次全局继承：把当前项目的供应商配置（vendors+角色）同步为全局默认，
+        写入 config.json。之后新建项目自动继承，用户无需重复配置。
+        保留 config.json 其他字段（遥控配置等），只更新 3 个全局字段。"""
+        try:
+            p = self.current_project
+            if not p:
+                return
+            cfg = load_config()   # 合并现有文件 + 默认值，避免丢遥控配置
+            cfg["global_vendors"] = [json.loads(json.dumps(v)) for v in p.get("vendors", [])]
+            cfg["global_text_vendor_id"] = p.get("text_vendor_id", "")
+            cfg["global_media_vendor_id"] = p.get("media_vendor_id", "")
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            self.current_config = cfg   # 内存同步，下次新建项目立即可继承
+        except Exception:
+            pass
+
     def _auto_save_project(self):
         """自动保存项目（静默，无提示）"""
         self._vendor_save_after = None
@@ -1427,13 +1909,26 @@ class CineMasterUI:
                 p["storyboard_chapter"] = "全部章节"
             p["image_history"] = [{'url': it.get('url', ''), 'name': it.get('name', ''),
                                    'type': it.get('type', ''), 'chapter': it.get('chapter', ''),
-                                   'prompt': it.get('prompt', ''), 'prompt_cn': it.get('prompt_cn', '')}
+                                   'prompt': it.get('prompt', ''), 'prompt_cn': it.get('prompt_cn', ''),
+                                   'local_path': it.get('local_path', '')}
                                   for it in self.image_history]
             p["video_history"] = self.video_history
+            # 2026-08-21 视频本地保存路径映射（url → 本地 mp4 路径），随项目保存
+            try:
+                p["video_local_paths"] = dict(getattr(self, '_video_local_paths', {}) or {})
+            except Exception:
+                p["video_local_paths"] = {}
+            # 2026-08-21 视频预览帧目录映射（url → 帧 PNG 目录），随项目保存
+            try:
+                p["video_preview_frames"] = dict(getattr(self, '_video_preview_frames', {}) or {})
+            except Exception:
+                p["video_preview_frames"] = {}
             p["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
             path = self._project_path(p["name"])
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(p, f, ensure_ascii=False, indent=2)
+            # 2026-08-21 配置一次全局继承：自动保存时同步全局默认供应商
+            self._sync_global_vendor_defaults()
         except Exception:
             pass
 
@@ -1445,6 +1940,10 @@ class CineMasterUI:
         sel = self.vendor_listbox.curselection()
         if not sel:
             messagebox.showinfo(APP_NAME, "请先选择要删除的供应商")
+            return
+        # 2026-08-21 AI 遥控条目不可删除
+        if self._is_ai_remote_item(sel[0]):
+            messagebox.showinfo(APP_NAME, "「AI 遥控」是固定配置项，不可删除")
             return
         vendors = self._current_vendors()
         idx = sel[0]
@@ -1482,7 +1981,7 @@ class CineMasterUI:
             imgs = "、".join(m.get("display", m.get("name", "")) for m in t.get("models", []) if m.get("type") == "image")
             vids = "、".join(m.get("display", m.get("name", "")) for m in t.get("models", []) if m.get("type") == "video")
             lb.insert(tk.END, "%s  |  %s" % (t.get("name", ""), " / ".join(x for x in (models, imgs, vids) if x)))
-        tk.Label(dlg, text="模板仅提供供应商结构与模型清单，API Key 需自行填写", font=(_FONT_CN, 9),
+        tk.Label(dlg, text="模板仅提供供应商结构与模型清单，API Key 需自行填写", font=("微软雅黑", 9),
                  fg=COLOR_TEXT_DIM, bg=COLOR_PANEL).pack(anchor="w", padx=14)
 
         def pick():
@@ -1528,7 +2027,7 @@ class CineMasterUI:
                          fg=COLOR_TEXT, insertbackground=COLOR_TEXT)
         e_url.pack(padx=14, fill="x")
         tk.Label(dlg, text="JSON 格式：{\"name\":\"供应商名\",\"base_url\":\"https://...\",\"models\":[{\"name\":\"模型名\",\"type\":\"text|image|video\"}]}",
-                 font=(_FONT_CN, 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL).pack(anchor="w", padx=14, pady=(6, 10))
+                 font=("微软雅黑", 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL).pack(anchor="w", padx=14, pady=(6, 10))
         st = tk.Label(dlg, text="", font=FONT_MAIN, fg=COLOR_SUCCESS, bg=COLOR_PANEL)
         st.pack(anchor="w", padx=14)
 
@@ -1626,7 +2125,7 @@ class CineMasterUI:
         c_type = ttk.Combobox(dlg, values=("text", "image", "video"), width=10, font=FONT_MAIN, state="readonly")
         c_type.set("text")
         c_type.grid(row=2, column=1, padx=12, pady=4, sticky="w")
-        tk.Label(dlg, text="提示：模型名需与供应商实际提供的名称一致", font=(_FONT_CN, 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL).grid(row=3, column=0, columnspan=2, padx=12, pady=(2, 8), sticky="w")
+        tk.Label(dlg, text="提示：模型名需与供应商实际提供的名称一致", font=("微软雅黑", 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL).grid(row=3, column=0, columnspan=2, padx=12, pady=(2, 8), sticky="w")
         # 编辑模式预填
         if is_edit:
             m = v.get("models", [])[edit_idx]
@@ -1700,6 +2199,10 @@ class CineMasterUI:
         self._apply_vendor_edits()
         sel = self.vendor_listbox.curselection()
         if not sel:
+            return
+        # 2026-08-21 AI 遥控条目不可设角色
+        if self._is_ai_remote_item(sel[0]):
+            self._show_toast("「AI 遥控」不是供应商，不能设为文本/媒体供应商", "warning")
             return
         vendors = self._current_vendors()
         vid = vendors[sel[0]].get("id")
@@ -1808,9 +2311,51 @@ class CineMasterUI:
         text_ok = bool(tv and sanitize_api_key(tv.get("api_key", "")))
         media_ok = bool(mv and (self._is_comfyui_vendor(mv) or sanitize_api_key(mv.get("api_key", ""))))
         if text_ok and media_ok:
-            self.notebook.tab(2, state="normal")
+            # 2026-08-21 配置完成后统一激活：控制台/生成器/单镜工作台（剪辑 tab 已隐藏）
+            for _i in range(1, 4):
+                self.notebook.tab(_i, state="normal")
         else:
-            self.notebook.tab(2, state="disabled")
+            for _i in range(1, 4):
+                self.notebook.tab(_i, state="disabled")
+            # 未配置完成时强制停在「配置」页，不允许停留在其他功能页
+            try:
+                if self.notebook.index(self.notebook.select()) != 0:
+                    self.notebook.select(0)
+            except Exception:
+                pass
+
+    def _start_btn_timeout_watch(self):
+        """2026-08-21 需求2：批量生成按钮超时自动恢复看门狗（每 15 秒查一次，3 分钟强制恢复）"""
+        try:
+            def _tick():
+                try:
+                    now = time.time()
+                    for _k, _ts in list(self._btn_lock_times.items()):
+                        if now - _ts > self._btn_timeout_seconds:
+                            # 超时强制恢复按钮
+                            if _k == 'gen_img':
+                                for _b in (self.btn_gen_img, self.btn_gen_images_batch):
+                                    try:
+                                        _b.config(state=tk.NORMAL)
+                                    except Exception:
+                                        pass
+                            elif _k == 'gen_vid':
+                                for _b in (self.btn_gen_vid, self.btn_gen_sb_all):
+                                    try:
+                                        _b.config(state=tk.NORMAL)
+                                    except Exception:
+                                        pass
+                            self._btn_lock_times.pop(_k, None)
+                            self._show_toast('生成任务疑似卡死（超时 %d 秒），按钮已重新激活，可重新提交' % self._btn_timeout_seconds, 'warning')
+                except Exception:
+                    pass
+                try:
+                    self.root.after(15000, _tick)
+                except Exception:
+                    pass
+            self.root.after(15000, _tick)
+        except Exception:
+            pass
 
 
 
@@ -1846,42 +2391,42 @@ class CineMasterUI:
         # LLM 自己创作剧本正文 + 后续资产。选中后标签变"创作需求输入"。
         self._create_mode_var = tk.BooleanVar(value=False)
         self._create_mode_chk = tk.Checkbutton(novel_bar, text="✍️ 按需求创作（无小说）",
-                                               font=(_FONT_CN, 9), bg=COLOR_PANEL,
+                                               font=("微软雅黑", 9), bg=COLOR_PANEL,
                                                fg=COLOR_ACCENT, selectcolor=COLOR_PANEL,
                                                activebackground=COLOR_PANEL,
                                                variable=self._create_mode_var,
                                                command=self._on_create_mode_toggle)
         self._create_mode_chk.pack(side="left", padx=(10, 0))
         # 上传小说文件（doc/docx/txt → 解析章节 → 填入输入框）
-        self.btn_upload_novel = tk.Button(novel_bar, text="📄 上传小说文件", font=(_FONT_CN, 9),
+        self.btn_upload_novel = tk.Button(novel_bar, text="📄 上传小说文件", font=("微软雅黑", 9),
                                           bg=COLOR_ACCENT, fg="white", relief="flat",
                                           padx=10, pady=1, command=self._upload_novel_file)
         self.btn_upload_novel.pack(side="left", padx=(10, 0))
         bind_hover(self.btn_upload_novel, COLOR_ACCENT, COLOR_ACCENT_DARK)
         # 章节状态标签（上传后显示识别到的章节数；章节选择在视频生成Tab）
-        self.label_chapter_info = tk.Label(novel_bar, text="", font=(_FONT_CN, 9),
+        self.label_chapter_info = tk.Label(novel_bar, text="", font=("微软雅黑", 9),
                                            bg=COLOR_PANEL, fg=COLOR_SUCCESS)
         self.label_chapter_info.pack(side="left", padx=(10, 0))
         # 题材选择器（Toonflow 导演技法集成）
-        tk.Label(novel_bar, text="  题材：", font=(_FONT_CN, 9), bg=COLOR_PANEL,
+        tk.Label(novel_bar, text="  题材：", font=("微软雅黑", 9), bg=COLOR_PANEL,
                  fg=COLOR_TEXT_DIM).pack(side="left", padx=(16, 0))
         self._genre_var = tk.StringVar(value="通用")
         genre_values = ["通用"] + list(GENRE_DIRECTOR_SKILLS.keys())
         self._genre_combo = ttk.Combobox(novel_bar, textvariable=self._genre_var,
                                          values=genre_values, state="readonly",
-                                         width=10, font=(_FONT_CN, 9))
+                                         width=10, font=("微软雅黑", 9))
         self._genre_combo.pack(side="left")
-        tk.Label(novel_bar, text="（导演手法随生成自动注入）", font=(_FONT_CN, 8),
+        tk.Label(novel_bar, text="（导演手法随生成自动注入）", font=("微软雅黑", 8),
                  bg=COLOR_PANEL, fg=COLOR_TEXT_DIM).pack(side="left", padx=(6, 0))
         # 全局风格选择器（用户要求：风格放小说旁，全局有效——图片/视频/提示词统一遵循）
-        tk.Label(novel_bar, text="  风格：", font=(_FONT_CN, 9), bg=COLOR_PANEL,
+        tk.Label(novel_bar, text="  风格：", font=("微软雅黑", 9), bg=COLOR_PANEL,
                  fg=COLOR_TEXT_DIM).pack(side="left", padx=(16, 0))
         self._style_var = tk.StringVar(value=DEFAULT_VIDEO_STYLE)
         self.combo_global_style = ttk.Combobox(novel_bar, textvariable=self._style_var,
                                                values=list(VIDEO_STYLE_PRESETS.keys()),
-                                               state="readonly", width=10, font=(_FONT_CN, 9))
+                                               state="readonly", width=10, font=("微软雅黑", 9))
         self.combo_global_style.pack(side="left")
-        tk.Label(novel_bar, text="（全局风格：图片+视频+提示词统一生效）", font=(_FONT_CN, 8),
+        tk.Label(novel_bar, text="（全局风格：图片+视频+提示词统一生效）", font=("微软雅黑", 8),
                  bg=COLOR_PANEL, fg=COLOR_TEXT_DIM).pack(side="left", padx=(6, 0))
         self.text_input_novel = scrolledtext.ScrolledText(
             frame_novel, font=FONT_MAIN, wrap=tk.WORD, height=12, relief="solid", bd=1,
@@ -1896,8 +2441,8 @@ class CineMasterUI:
         cmd_bar = tk.Frame(frame_cmd, bg=COLOR_PANEL)
         cmd_bar.pack(fill="x", padx=8, pady=(0, 4))
         tk.Label(cmd_bar, text="填写后点击上传，随小说一起发送给模型",
-                 font=(_FONT_CN, 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL).pack(side="left")
-        self.btn_upload_command = tk.Button(cmd_bar, text="▲ 上传指令", font=(_FONT_CN, 9),
+                 font=("微软雅黑", 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL).pack(side="left")
+        self.btn_upload_command = tk.Button(cmd_bar, text="▲ 上传指令", font=("微软雅黑", 9),
                                             bg=COLOR_ACCENT, fg="white", relief="flat",
                                             padx=12, pady=1, command=self._upload_command)
         self.btn_upload_command.pack(side="right")
@@ -2003,6 +2548,14 @@ class CineMasterUI:
     def _build_bottom_area(self, parent):
         frame = tk.Frame(parent, bg=COLOR_PANEL)
         frame.pack(fill="x", side="bottom", padx=10, pady=(0, 10))
+        # 2026-08-21 续写下一集：勾选后点「开始转化」→ 检测上一集资产已生成 → 自动开始第 N+1 集生成
+        self._continue_var = tk.BooleanVar(value=False)
+        self.chk_continue = tk.Checkbutton(frame, text="⏭ 续写下一集", font=("微软雅黑", 10),
+                                           bg=COLOR_PANEL, fg=COLOR_ACCENT, selectcolor=COLOR_PANEL,
+                                           activebackground=COLOR_PANEL, activeforeground=COLOR_ACCENT,
+                                           variable=self._continue_var,
+                                           command=self._on_continue_toggle)
+        self.chk_continue.pack(side="left", padx=(0, 8))
         self.btn_generate = tk.Button(frame, text="▶ 开始转化", font=FONT_TITLE, bg=COLOR_ACCENT,
                                       fg="white", relief="flat", padx=16, pady=2,
                                       activebackground=COLOR_ACCENT_DARK, activeforeground="white",
@@ -2025,9 +2578,30 @@ class CineMasterUI:
         bar_frame.pack(fill="x", pady=(8, 0))
         self.progress_bar = ttk.Progressbar(bar_frame, mode="indeterminate", style="Light.Horizontal.TProgressbar")
         self.progress_bar.pack(fill="x")
-        self.label_gen_time = tk.Label(bar_frame, text="就绪", font=(_FONT_CN, 9), fg=COLOR_TEXT_DIM,
+        self.label_gen_time = tk.Label(bar_frame, text="就绪", font=("微软雅黑", 9), fg=COLOR_TEXT_DIM,
                                        bg=COLOR_PANEL)
         self.label_gen_time.pack(anchor="w", pady=(2, 0))
+
+    def _on_continue_toggle(self):
+        """2026-08-21 续写复选框交互提示：勾选时检查是否有上一集资产可续写"""
+        try:
+            if self._continue_var.get():
+                _ep = int((self.current_project or {}).get('episode', 0) or 0)
+                _secs = (self.current_project or {}).get('sections', {}) or {}
+                _assets_done = any(
+                    ((_secs.get(k) or '').strip() or
+                     (self.text_widgets.get(k).get('1.0', tk.END).strip() if self.text_widgets.get(k) else ''))
+                    for k in ('character', 'scene', 'prop'))
+                if _assets_done:
+                    self._show_toast('⏭ 续写模式已开启：检测到第 %d 集资产已生成，开始转化后将自动生成第 %d 集'
+                                     % (_ep if _ep >= 1 else 1, (_ep if _ep >= 1 else 1) + 1), 'info')
+                else:
+                    self._show_toast('⚠️ 当前未检测到已生成的资产（角色/场景/道具），续写将无法开始。\n'
+                                     '请先完成第 1 集的全链路生成，再勾选续写。', 'warning')
+            else:
+                self._show_toast('续写已关闭：开始转化将从第 1 集（小说开头）生成', 'info')
+        except Exception:
+            pass
 
     def _build_output_area(self, parent):
         self.frame_output_area = tk.Frame(parent, bg=COLOR_PANEL, highlightbackground=COLOR_BORDER,
@@ -2053,7 +2627,7 @@ class CineMasterUI:
             if key == "all":
                 top = tk.Frame(tab, bg=COLOR_PANEL)
                 top.pack(fill="x", padx=6, pady=(6, 2))
-                btn_copy = tk.Button(top, text="一键复制全文", font=(_FONT_CN, 9), bg=COLOR_PANEL,
+                btn_copy = tk.Button(top, text="一键复制全文", font=("微软雅黑", 9), bg=COLOR_PANEL,
                                      fg=COLOR_TEXT_DIM, relief="solid", bd=1, highlightbackground="#D0D0D0",
                                      command=self._copy_all_text)
                 btn_copy.pack(side="right")
@@ -2113,32 +2687,32 @@ class CineMasterUI:
         # 操作按钮行
         btns = tk.Frame(frm, bg=COLOR_PANEL)
         btns.pack(fill="x", pady=(6, 4))
-        self.btn_edit_sync = tk.Button(btns, text="🔄 同步轨道", font=(_FONT_CN, 9),
+        self.btn_edit_sync = tk.Button(btns, text="🔄 同步轨道", font=("微软雅黑", 9),
                                        bg=COLOR_BORDER, fg=COLOR_TEXT, relief=tk.FLAT,
                                        command=self._sync_edit_tracks)
         self.btn_edit_sync.pack(side="left", padx=(0, 6))
         bind_hover(self.btn_edit_sync, COLOR_BORDER, "#D0D0D0")
-        self.btn_edit_export = tk.Button(btns, text="🎬 导出成片（FCP XML）", font=(_FONT_CN, 9),
+        self.btn_edit_export = tk.Button(btns, text="🎬 导出成片（FCP XML）", font=("微软雅黑", 9),
                                          bg="#28A745", fg="white", relief=tk.FLAT,
                                          command=self._export_fcpxml)
         self.btn_edit_export.pack(side="left", padx=(0, 6))
         bind_hover(self.btn_edit_export, "#28A745", "#1F8B38")
-        self.btn_edit_srt = tk.Button(btns, text="💬 导出字幕（SRT）", font=(_FONT_CN, 9),
+        self.btn_edit_srt = tk.Button(btns, text="💬 导出字幕（SRT）", font=("微软雅黑", 9),
                                       bg=COLOR_BORDER, fg=COLOR_TEXT, relief=tk.FLAT,
                                       command=self._export_srt)
         self.btn_edit_srt.pack(side="left", padx=(0, 6))
         bind_hover(self.btn_edit_srt, COLOR_BORDER, "#D0D0D0")
-        self.btn_edit_import = tk.Button(btns, text="📂 导入 FCP XML", font=(_FONT_CN, 9),
+        self.btn_edit_import = tk.Button(btns, text="📂 导入 FCP XML", font=("微软雅黑", 9),
                                          bg=COLOR_BORDER, fg=COLOR_TEXT, relief=tk.FLAT,
                                          command=self._import_fcpxml)
         self.btn_edit_import.pack(side="left")
         bind_hover(self.btn_edit_import, COLOR_BORDER, "#D0D0D0")
-        self.btn_edit_srt_import = tk.Button(btns, text="💬 导入 SRT 字幕", font=(_FONT_CN, 9),
+        self.btn_edit_srt_import = tk.Button(btns, text="💬 导入 SRT 字幕", font=("微软雅黑", 9),
                                              bg=COLOR_BORDER, fg=COLOR_TEXT, relief=tk.FLAT,
                                              command=self._import_srt)
         self.btn_edit_srt_import.pack(side="left", padx=(6, 0))
         bind_hover(self.btn_edit_srt_import, COLOR_BORDER, "#D0D0D0")
-        tk.Label(btns, text="  帧率:", font=(_FONT_CN, 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL).pack(side="left")
+        tk.Label(btns, text="  帧率:", font=("微软雅黑", 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL).pack(side="left")
         self.combo_edit_fps = ttk.Combobox(btns, values=("24", "25", "30"), width=4,
                                            state="readonly", font=FONT_MAIN)
         self.combo_edit_fps.set("25")
@@ -2146,27 +2720,27 @@ class CineMasterUI:
         # 片段属性编辑行（选中片段后显示）
         prop_row = tk.Frame(frm, bg=COLOR_PANEL)
         prop_row.pack(fill="x", pady=2)
-        tk.Label(prop_row, text="选中片段：", font=(_FONT_CN, 9), fg=COLOR_TEXT_DIM,
+        tk.Label(prop_row, text="选中片段：", font=("微软雅黑", 9), fg=COLOR_TEXT_DIM,
                  bg=COLOR_PANEL).pack(side="left")
-        self.label_edit_sel = tk.Label(prop_row, text="（未选中）", font=(_FONT_CN, 9),
+        self.label_edit_sel = tk.Label(prop_row, text="（未选中）", font=("微软雅黑", 9),
                                        fg=COLOR_TEXT, bg=COLOR_PANEL, width=20, anchor="w")
         self.label_edit_sel.pack(side="left")
-        tk.Label(prop_row, text="裁剪起点(s):", font=(_FONT_CN, 9), fg=COLOR_TEXT_DIM,
+        tk.Label(prop_row, text="裁剪起点(s):", font=("微软雅黑", 9), fg=COLOR_TEXT_DIM,
                  bg=COLOR_PANEL).pack(side="left", padx=(8, 2))
         self.entry_edit_trim = tk.Entry(prop_row, width=5, font=FONT_MAIN, bg=COLOR_INPUT,
                                         fg=COLOR_TEXT, insertbackground=COLOR_TEXT)
         self.entry_edit_trim.pack(side="left")
-        tk.Label(prop_row, text="变速(x):", font=(_FONT_CN, 9), fg=COLOR_TEXT_DIM,
+        tk.Label(prop_row, text="变速(x):", font=("微软雅黑", 9), fg=COLOR_TEXT_DIM,
                  bg=COLOR_PANEL).pack(side="left", padx=(8, 2))
         self.entry_edit_speed = tk.Entry(prop_row, width=5, font=FONT_MAIN, bg=COLOR_INPUT,
                                          fg=COLOR_TEXT, insertbackground=COLOR_TEXT)
         self.entry_edit_speed.pack(side="left")
-        tk.Label(prop_row, text="音量(%):", font=(_FONT_CN, 9), fg=COLOR_TEXT_DIM,
+        tk.Label(prop_row, text="音量(%):", font=("微软雅黑", 9), fg=COLOR_TEXT_DIM,
                  bg=COLOR_PANEL).pack(side="left", padx=(8, 2))
         self.entry_edit_vol = tk.Entry(prop_row, width=5, font=FONT_MAIN, bg=COLOR_INPUT,
                                        fg=COLOR_TEXT, insertbackground=COLOR_TEXT)
         self.entry_edit_vol.pack(side="left")
-        self.btn_edit_apply = tk.Button(prop_row, text="应用", font=(_FONT_CN, 9),
+        self.btn_edit_apply = tk.Button(prop_row, text="应用", font=("微软雅黑", 9),
                                         bg=COLOR_ACCENT, fg="white", relief=tk.FLAT,
                                         command=self._apply_clip_props)
         self.btn_edit_apply.pack(side="left", padx=(8, 0))
@@ -2174,23 +2748,23 @@ class CineMasterUI:
         # 静音勾选（对齐 Cosmius：mute 音频）
         self.var_edit_mute = tk.BooleanVar(value=False)
         self.chk_edit_mute = tk.Checkbutton(prop_row, text="静音", variable=self.var_edit_mute,
-                                            font=(_FONT_CN, 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL,
+                                            font=("微软雅黑", 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL,
                                             activebackground=COLOR_PANEL, selectcolor=COLOR_INPUT,
                                             command=self._apply_clip_props)
         self.chk_edit_mute.pack(side="left", padx=(8, 0))
         # 转场类型（对齐 Cosmius：transitionIn/Out，dissolve）
-        tk.Label(prop_row, text="转场:", font=(_FONT_CN, 9), fg=COLOR_TEXT_DIM,
+        tk.Label(prop_row, text="转场:", font=("微软雅黑", 9), fg=COLOR_TEXT_DIM,
                  bg=COLOR_PANEL).pack(side="left", padx=(8, 2))
         self.combo_edit_trans = ttk.Combobox(prop_row, values=("无", "交叉溶解"), width=8,
                                              state="readonly", font=FONT_MAIN)
         self.combo_edit_trans.set("无")
         self.combo_edit_trans.pack(side="left")
-        self.btn_edit_dup = tk.Button(prop_row, text="📄 复制片段", font=(_FONT_CN, 9),
+        self.btn_edit_dup = tk.Button(prop_row, text="📄 复制片段", font=("微软雅黑", 9),
                                       bg=COLOR_BORDER, fg=COLOR_TEXT, relief=tk.FLAT,
                                       command=self._duplicate_clip)
         self.btn_edit_dup.pack(side="left", padx=(8, 0))
         bind_hover(self.btn_edit_dup, COLOR_BORDER, "#D0D0D0")
-        self.btn_edit_del = tk.Button(prop_row, text="🗑 删除片段", font=(_FONT_CN, 9),
+        self.btn_edit_del = tk.Button(prop_row, text="🗑 删除片段", font=("微软雅黑", 9),
                                       bg=COLOR_DANGER, fg="white", relief=tk.FLAT,
                                       command=self._delete_clip)
         self.btn_edit_del.pack(side="left", padx=(6, 0))
@@ -2262,7 +2836,7 @@ class CineMasterUI:
         c.delete("all")
         if not self.edit_tracks:
             c.create_text(10, 20, anchor="w", text="暂无时间线，点击「同步轨道」生成",
-                          font=(_FONT_CN, 10), fill=COLOR_TEXT_DIM)
+                          font=("微软雅黑", 10), fill=COLOR_TEXT_DIM)
             return
         # 轨道高度/行距
         row_h = 34
@@ -2270,26 +2844,26 @@ class CineMasterUI:
         pps = self._edit_tl_pps
         # 时间刻度（顶部）
         total_dur = sum(max(0.5, (t["duration"] / max(0.1, t["speed"]))) if t["enabled"] else 0 for t in self.edit_tracks)
-        c.create_text(x0 + 10, 8, anchor="w", text="时间 →", font=(_FONT_CN, 8), fill=COLOR_TEXT_DIM)
+        c.create_text(x0 + 10, 8, anchor="w", text="时间 →", font=("微软雅黑", 8), fill=COLOR_TEXT_DIM)
         for sec in range(0, int(total_dur) + 2, 5):
             px = x0 + sec * pps
             c.create_line(px, 18, px, 24, fill=COLOR_BORDER)
-            c.create_text(px + 2, 26, anchor="w", text="%ds" % sec, font=(_FONT_CN, 7), fill=COLOR_TEXT_DIM)
+            c.create_text(px + 2, 26, anchor="w", text="%ds" % sec, font=("微软雅黑", 7), fill=COLOR_TEXT_DIM)
         # 轨道
         cursor = 0.0
         for idx, tr in enumerate(self.edit_tracks):
             y = 40 + idx * row_h
             # 轨道标签
             c.create_text(6, y + row_h // 2, anchor="w",
-                          text="分镜%s" % tr["num"], font=(_FONT_CN, 9, "bold"),
+                          text="分镜%s" % tr["num"], font=("微软雅黑", 9, "bold"),
                           fill=COLOR_ACCENT if tr["enabled"] else COLOR_TEXT_DIM)
             c.create_text(6, y + row_h // 2 + 12, anchor="w",
-                          text="%ss" % tr["duration"], font=(_FONT_CN, 7), fill=COLOR_TEXT_DIM)
+                          text="%ss" % tr["duration"], font=("微软雅黑", 7), fill=COLOR_TEXT_DIM)
             # 轨道分隔线
             c.create_line(x0, y + row_h, x0 + max(200, total_dur * pps), y + row_h, fill=COLOR_BORDER)
             if not tr["enabled"]:
                 c.create_text(x0 + 10, y + row_h // 2, anchor="w", text="（已禁用）",
-                              font=(_FONT_CN, 9), fill=COLOR_TEXT_DIM)
+                              font=("微软雅黑", 9), fill=COLOR_TEXT_DIM)
                 continue
             # 片段块
             dur_px = max(20, tr["duration"] / max(0.1, tr["speed"]) * pps)
@@ -2301,22 +2875,22 @@ class CineMasterUI:
                                outline=COLOR_ACCENT if idx == self._edit_selected else COLOR_BORDER,
                                width=2 if idx == self._edit_selected else 1)
             c.create_text(bx + 6, by + 6, anchor="w", text="分镜%s" % tr["num"],
-                          font=(_FONT_CN, 8, "bold"), fill="#FFFFFF")
+                          font=("微软雅黑", 8, "bold"), fill="#FFFFFF")
             spd = "" if abs(tr["speed"] - 1.0) < 0.01 else " x%.1f" % tr["speed"]
             c.create_text(bx + 6, by + bh - 12, anchor="w",
                           text="%ss%s%s" % (tr["duration"], spd, " 🔇" if tr.get("muted") else ""),
-                          font=(_FONT_CN, 7), fill="#C9CCE8")
+                          font=("微软雅黑", 7), fill="#C9CCE8")
             # 转场标记（对齐 Cosmius：transitionIn 在片段左侧绘制重叠过渡条）
             if tr.get("transition", "无") != "无" and idx > 0:
                 trans_w = min(18, dur_px / 2)
                 c.create_rectangle(bx - trans_w, by + bh - 6, bx, by + bh,
                                    fill="#F59E0B", outline="")
                 c.create_text(bx - trans_w / 2, by + bh - 4, text="⇄",
-                              font=(_FONT_CN, 6), fill="#1A1A2E")
+                              font=("微软雅黑", 6), fill="#1A1A2E")
             cursor += tr["duration"] / max(0.1, tr["speed"])
         # 总时长
         c.create_text(6, 40 + len(self.edit_tracks) * row_h + 10, anchor="w",
-                      text="总时长：%.1fs" % total_dur, font=(_FONT_CN, 9),
+                      text="总时长：%.1fs" % total_dur, font=("微软雅黑", 9),
                       fill=COLOR_CREDITS)
         c.configure(scrollregion=(0, 0, x0 + max(300, total_dur * pps), 60 + len(self.edit_tracks) * row_h))
 
@@ -2700,18 +3274,18 @@ class CineMasterUI:
         ref_head.pack(fill="x", pady=(8, 2))
         tk.Label(ref_head, text="参考图（最多 9 张，从图片历史勾选；无参考图=纯文生视频）：",
                  font=FONT_MAIN, fg=COLOR_TEXT_DIM, bg=COLOR_PANEL).pack(side="left")
-        self.btn_single_pick_ref = tk.Button(ref_head, text="🖼 选择参考图", font=(_FONT_CN, 9),
+        self.btn_single_pick_ref = tk.Button(ref_head, text="🖼 选择参考图", font=("微软雅黑", 9),
                                              bg=COLOR_BORDER, fg=COLOR_TEXT, relief=tk.FLAT,
                                              command=self._single_shot_pick_refs)
         self.btn_single_pick_ref.pack(side="right")
         bind_hover(self.btn_single_pick_ref, COLOR_BORDER, "#D0D0D0")
         # 2026-08-17 任务3：主界面直接上传本地图片（不必先进选择对话框；≤9 张）
-        self.btn_single_upload_main = tk.Button(ref_head, text="📁 上传本地图", font=(_FONT_CN, 9),
+        self.btn_single_upload_main = tk.Button(ref_head, text="📁 上传本地图", font=("微软雅黑", 9),
                                                 bg="#28A745", fg="white", relief=tk.FLAT,
                                                 command=self._single_shot_upload_local_main)
         self.btn_single_upload_main.pack(side="right", padx=(0, 6))
         bind_hover(self.btn_single_upload_main, "#28A745", "#1F8B38")
-        self.btn_single_clear_ref = tk.Button(ref_head, text="清空", font=(_FONT_CN, 9),
+        self.btn_single_clear_ref = tk.Button(ref_head, text="清空", font=("微软雅黑", 9),
                                               bg=COLOR_BORDER, fg=COLOR_TEXT, relief=tk.FLAT,
                                               command=lambda: self._single_shot_set_refs([]))
         self.btn_single_clear_ref.pack(side="right", padx=(0, 6))
@@ -2719,11 +3293,11 @@ class CineMasterUI:
         # 已选参考图显示
         self.single_ref_frame = tk.Frame(frm, bg=COLOR_PANEL)
         self.single_ref_frame.pack(fill="x", pady=2)
-        self.single_ref_label = tk.Label(self.single_ref_frame, text="未选择参考图", font=(_FONT_CN, 9),
+        self.single_ref_label = tk.Label(self.single_ref_frame, text="未选择参考图", font=("微软雅黑", 9),
                                          fg=COLOR_TEXT_DIM, bg=COLOR_PANEL)
         self.single_ref_label.pack(anchor="w")
         # 生成按钮
-        self.btn_single_gen = tk.Button(frm, text="🎬 生成视频", font=(_FONT_CN, 11),
+        self.btn_single_gen = tk.Button(frm, text="🎬 生成视频", font=("微软雅黑", 11),
                                         bg=COLOR_ACCENT, fg="white", relief=tk.FLAT,
                                         command=self._on_single_shot_gen)
         self.btn_single_gen.pack(fill="x", pady=(10, 4), ipady=4)
@@ -2750,14 +3324,14 @@ class CineMasterUI:
             w.destroy()
         refs = self.single_shot_refs
         if not refs:
-            self.single_ref_label = tk.Label(self.single_ref_frame, text="未选择参考图", font=(_FONT_CN, 9),
+            self.single_ref_label = tk.Label(self.single_ref_frame, text="未选择参考图", font=("微软雅黑", 9),
                                              fg=COLOR_TEXT_DIM, bg=COLOR_PANEL)
             self.single_ref_label.pack(anchor="w")
             return
         row = tk.Frame(self.single_ref_frame, bg=COLOR_PANEL)
         row.pack(fill="x")
         for i, url in enumerate(refs[:9]):
-            thumb = tk.Label(row, text="图%d" % (i + 1), font=(_FONT_CN, 8), width=6, height=2,
+            thumb = tk.Label(row, text="图%d" % (i + 1), font=("微软雅黑", 8), width=6, height=2,
                              bg=COLOR_INPUT, fg=COLOR_TEXT, relief="solid", bd=1)
             thumb.pack(side="left", padx=2)
             try:
@@ -2789,12 +3363,12 @@ class CineMasterUI:
         tk.Label(head, text="勾选参考图（最多 9 张）：", font=FONT_MAIN,
                  fg=COLOR_TEXT, bg=COLOR_PANEL).pack(side="left")
         # 上传本地图片按钮
-        self._btn_single_upload = tk.Button(head, text="📁 上传本地图片", font=(_FONT_CN, 9),
+        self._btn_single_upload = tk.Button(head, text="📁 上传本地图片", font=("微软雅黑", 9),
                                             bg="#28A745", fg="white", relief=tk.FLAT,
                                             command=lambda: self._single_shot_upload_local(dlg))
         self._btn_single_upload.pack(side="right")
         bind_hover(self._btn_single_upload, "#28A745", "#1F8B38")
-        self._single_pick_status = tk.Label(head, text="", font=(_FONT_CN, 8),
+        self._single_pick_status = tk.Label(head, text="", font=("微软雅黑", 8),
                                             fg=COLOR_CREDITS, bg=COLOR_PANEL)
         self._single_pick_status.pack(side="right", padx=(0, 8))
         canvas = tk.Canvas(dlg, bg=COLOR_PANEL, highlightthickness=0)
@@ -2828,7 +3402,7 @@ class CineMasterUI:
                 except Exception:
                     pass
             tk.Label(cell, text=name or os.path.basename(url.split("?")[0]),
-                     font=(_FONT_CN, 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL).pack(side="left")
+                     font=("微软雅黑", 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL).pack(side="left")
         def _confirm():
             sel = [u for u, v in vars_map.items() if v.get()]
             dlg.destroy()
@@ -2945,7 +3519,18 @@ class CineMasterUI:
         """后台线程：提示词加执行要求前缀 → agent.generate_video → 等待完成"""
         try:
             base = self._story_batch_done
-            self.agent.generate_video(prompt, cfg, dur, ratio, res, list(refs))
+            _local_refs = []
+            try:
+                for _u in (refs or []):
+                    _lp = ''
+                    for _it in self.image_history:
+                        if _it.get('url') == _u and _it.get('local_path') and os.path.exists(_it.get('local_path', '')):
+                            _lp = _it.get('local_path')
+                            break
+                    _local_refs.append(_lp)
+            except Exception:
+                pass
+            self.agent.generate_video(prompt, cfg, dur, ratio, res, list(refs), local_refs=_local_refs)
             deadline = time.time() + 2400
             while time.time() < deadline and self._story_batch_done == base:
                 if getattr(self.ctx, "stop_flag", False):
@@ -3010,22 +3595,22 @@ class CineMasterUI:
         bind_hover(self.btn_gen_images_batch, "#28A745", "#1F8B38")
         # 跨章节资产复用开关：勾选=跳过已生成过的同名资产（默认不勾选=全部生成，2026-08-09 全资产生成要求）；取消=强制全部重新生成
         self._var_skip_existing = tk.BooleanVar(value=False)
-        tk.Checkbutton(btn_row, text="跳过已生成", font=(_FONT_CN, 8), bg=COLOR_PANEL,
+        tk.Checkbutton(btn_row, text="跳过已生成", font=("微软雅黑", 8), bg=COLOR_PANEL,
                        fg=COLOR_TEXT_DIM, activebackground=COLOR_PANEL,
                        variable=self._var_skip_existing).pack(side="left", padx=(8, 0))
         # 音色匹配区（生成完资产图后，为每个角色上传专属音色；生成视频时对应人物自动使用）
         self._build_voice_area(frm)
         hist_head = tk.Frame(frm, bg=COLOR_PANEL)
         hist_head.pack(anchor="w", fill="x", pady=(8, 2))
-        tk.Label(hist_head, text="▼ 图片历史记录 (单击选中/取消，双击放大预览)", font=(_FONT_CN, 9),
+        tk.Label(hist_head, text="▼ 图片历史记录 (单击选中/取消，双击放大预览)", font=("微软雅黑", 9),
                  fg=COLOR_TEXT_DIM, bg=COLOR_PANEL).pack(side="left")
         # 2026-08-15 需求1：上传本地图片到历史记录（供视频参考图使用）
-        self.btn_upload_hist = tk.Button(hist_head, text="📤 上传图片", font=(_FONT_CN, 9),
+        self.btn_upload_hist = tk.Button(hist_head, text="📤 上传图片", font=("微软雅黑", 9),
                                          bg="#6C8EBF", fg="white", relief="flat",
                                          command=self._upload_history_image)
         self.btn_upload_hist.pack(side="right", padx=(0, 6))
         bind_hover(self.btn_upload_hist, "#6C8EBF", "#5578A8")
-        self.btn_del_hist = tk.Button(hist_head, text="🗑 删除选中图片", font=(_FONT_CN, 9),
+        self.btn_del_hist = tk.Button(hist_head, text="🗑 删除选中图片", font=("微软雅黑", 9),
                                       bg=COLOR_DANGER, fg="white", relief="flat",
                                       command=self._delete_selected_images)
         self.btn_del_hist.pack(side="right")
@@ -3052,8 +3637,8 @@ class CineMasterUI:
         voice_head = tk.Frame(parent, bg=COLOR_PANEL)
         voice_head.pack(anchor="w", fill="x", pady=(8, 2))
         tk.Label(voice_head, text="▼ 音色匹配 (人物资产 · 为每个角色上传专属音色，生成视频时自动使用)",
-                 font=(_FONT_CN, 9), fg=COLOR_ACCENT, bg=COLOR_PANEL).pack(side="left")
-        self.btn_refresh_voice = tk.Button(voice_head, text="🔄 刷新", font=(_FONT_CN, 8),
+                 font=("微软雅黑", 9), fg=COLOR_ACCENT, bg=COLOR_PANEL).pack(side="left")
+        self.btn_refresh_voice = tk.Button(voice_head, text="🔄 刷新", font=("微软雅黑", 8),
                                            bg=COLOR_PANEL, fg=COLOR_TEXT_DIM, relief="solid", bd=1,
                                            highlightbackground="#D0D0D0",
                                            command=self._rebuild_voice_area)
@@ -3113,7 +3698,7 @@ class CineMasterUI:
             if not chars:
                 tk.Label(self.voice_inner,
                          text='（暂无人物资产图。\n生成完资产图后，这里会列出每个角色，可为每个角色上传专属音色，\n生成视频时对应人物自动使用该音色。）',
-                         font=(_FONT_CN, 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL,
+                         font=("微软雅黑", 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL,
                          justify="left").pack(anchor="w", pady=8, padx=10)
                 self.voice_canvas.configure(scrollregion=self.voice_canvas.bbox("all"))
                 return
@@ -3149,19 +3734,19 @@ class CineMasterUI:
             if ph:
                 cv.create_image(34, 30, image=ph)
             else:
-                cv.create_text(34, 30, text="无图", fill=COLOR_TEXT_DIM, font=(_FONT_CN, 8))
-            cv.create_text(34, 64, text=core[:8], fill=COLOR_TEXT_DIM, font=(_FONT_CN, 7), anchor="s")
+                cv.create_text(34, 30, text="无图", fill=COLOR_TEXT_DIM, font=("微软雅黑", 8))
+            cv.create_text(34, 64, text=core[:8], fill=COLOR_TEXT_DIM, font=("微软雅黑", 7), anchor="s")
             vrow = tk.Frame(cell, bg=COLOR_PANEL)
             vrow.pack(side="top", pady=(2, 0))
             _vpath = (self.asset_voices or {}).get(core, '')
             if _vpath and os.path.exists(_vpath):
-                tk.Label(vrow, text='🎵 ' + os.path.basename(_vpath)[:8], font=(_FONT_CN, 7),
+                tk.Label(vrow, text='🎵 ' + os.path.basename(_vpath)[:8], font=("微软雅黑", 7),
                          fg=COLOR_SUCCESS, bg=COLOR_PANEL).pack(side="left")
-                tk.Button(vrow, text="✕", font=(_FONT_CN, 7), bg=COLOR_PANEL,
+                tk.Button(vrow, text="✕", font=("微软雅黑", 7), bg=COLOR_PANEL,
                           fg=COLOR_DANGER, relief="flat", padx=2,
                           command=lambda c=core: self._clear_asset_voice(c)).pack(side="left")
             else:
-                tk.Button(vrow, text="🎵 音色", font=(_FONT_CN, 7), bg=COLOR_PANEL,
+                tk.Button(vrow, text="🎵 音色", font=("微软雅黑", 7), bg=COLOR_PANEL,
                           fg=COLOR_ACCENT, relief="solid", bd=1, highlightbackground=COLOR_BORDER,
                           padx=4, command=lambda c=core: self._upload_asset_voice(c)).pack(side="left")
         except Exception:
@@ -3176,24 +3761,24 @@ class CineMasterUI:
 
         # 上：视频提示词（分镜列表）+ 参数 + 生成按钮
         frame_vid_top = tk.Frame(paned_vid_right, bg=COLOR_INPUT)
-        paned_vid_right.add(frame_vid_top, minsize=420)
+        paned_vid_right.add(frame_vid_top)
         # ---- 视频提示词 = 分镜列表（自动同步自分镜资产，每个分镜前有选择框，可编辑）----
         sb_head = tk.Frame(frame_vid_top, bg=COLOR_INPUT)
         sb_head.pack(fill="x", pady=(5, 2))
         tk.Label(sb_head, text="▼ 视频提示词（分镜 · 自动同步自分镜资产 · 可编辑 · 勾选后生成视频）",
                  font=FONT_MAIN, fg=COLOR_ACCENT, bg=COLOR_INPUT).pack(side="left")
         # 2026-08-15 需求：全选/取消全选按钮（一键勾选或取消所有分镜复选框）
-        self.btn_sb_select_all = tk.Button(sb_head, text="☑ 全选", font=(_FONT_CN, 8),
+        self.btn_sb_select_all = tk.Button(sb_head, text="☑ 全选", font=("微软雅黑", 8),
                                            bg=COLOR_BORDER, fg=COLOR_TEXT, relief=tk.FLAT,
                                            command=lambda: self._set_sb_all_checked(True))
         self.btn_sb_select_all.pack(side="right", padx=(0, 6))
         bind_hover(self.btn_sb_select_all, COLOR_BORDER, "#D0D0D0")
-        self.btn_sb_unselect_all = tk.Button(sb_head, text="□ 取消全选", font=(_FONT_CN, 8),
+        self.btn_sb_unselect_all = tk.Button(sb_head, text="□ 取消全选", font=("微软雅黑", 8),
                                              bg=COLOR_BORDER, fg=COLOR_TEXT, relief=tk.FLAT,
                                              command=lambda: self._set_sb_all_checked(False))
         self.btn_sb_unselect_all.pack(side="right")
         bind_hover(self.btn_sb_unselect_all, COLOR_BORDER, "#D0D0D0")
-        btn_sync_sb = tk.Button(sb_head, text="🔄 重新同步", font=(_FONT_CN, 8), bg=COLOR_BORDER,
+        btn_sync_sb = tk.Button(sb_head, text="🔄 重新同步", font=("微软雅黑", 8), bg=COLOR_BORDER,
                                 fg=COLOR_TEXT, relief=tk.FLAT, command=self._sync_storyboard_all)
         btn_sync_sb.pack(side="right")
         bind_hover(btn_sync_sb, COLOR_BORDER, "#D0D0D0")
@@ -3213,12 +3798,12 @@ class CineMasterUI:
         self.sb_canvas.bind("<MouseWheel>", self._on_sb_wheel)
         sb_btns = tk.Frame(frame_vid_top, bg=COLOR_INPUT)
         sb_btns.pack(fill="x", pady=4)
-        self.btn_gen_vid = tk.Button(sb_btns, text="🎬 生成选中分镜视频", font=(_FONT_CN, 9),
+        self.btn_gen_vid = tk.Button(sb_btns, text="🎬 生成选中分镜视频", font=("微软雅黑", 9),
                                      bg=COLOR_ACCENT, fg="white", relief=tk.FLAT,
                                      command=self._on_gen_selected_sb_videos)
         self.btn_gen_vid.pack(side="left", expand=True, fill="x", padx=(0, 3), ipady=3)
         bind_hover(self.btn_gen_vid, COLOR_ACCENT, COLOR_ACCENT_DARK)
-        self.btn_gen_sb_all = tk.Button(sb_btns, text="🚀 生成全部分镜视频", font=(_FONT_CN, 9),
+        self.btn_gen_sb_all = tk.Button(sb_btns, text="🚀 生成全部分镜视频", font=("微软雅黑", 9),
                                         bg="#28A745", fg="white", relief=tk.FLAT,
                                         command=self._on_gen_all_sb_videos)
         self.btn_gen_sb_all.pack(side="left", expand=True, fill="x", padx=(3, 0), ipady=3)
@@ -3276,13 +3861,15 @@ class CineMasterUI:
         self.label_vid_credits = tk.Label(frame_vid_settings, text="预计消耗: 24 积分", font=FONT_MAIN,
                                           fg=COLOR_CREDITS, bg=COLOR_INPUT)
         self.label_vid_credits.pack(side=tk.LEFT, padx=15)
+        # 2026-08-21 隐藏状态行：下拉菜单行下方的"分镜视频生成进度"区域占面积，用户要求隐藏。
+        # （进度改由视频历史列表顶部的跑马灯行显示；label 保留创建但不再 pack——config 调用仍安全）
         self.label_vid_status = tk.Label(frame_vid_top, text="等待生成...", font=FONT_MAIN,
                                          fg=COLOR_TEXT_DIM, bg=COLOR_INPUT)
-        self.label_vid_status.pack(anchor="w", pady=2)
+        # self.label_vid_status.pack(anchor="w", pady=2)
 
         # 下：视频历史记录展示区
         frame_vid_history = tk.Frame(paned_vid_right, bg=COLOR_INPUT)
-        paned_vid_right.add(frame_vid_history, minsize=150)
+        paned_vid_right.add(frame_vid_history)
         tk.Label(frame_vid_history, text="▼ 视频历史记录 (可拖拽上方边界调整大小)", font=FONT_MAIN,
                  fg=COLOR_ACCENT, bg=COLOR_INPUT).pack(anchor="w", pady=5)
         hist = tk.Frame(frame_vid_history, bg=COLOR_INPUT)
@@ -4229,7 +4816,7 @@ class CineMasterUI:
                 pass
             return
         _render_ok = 0
-        for p in prompts:
+        for _pi, p in enumerate(prompts):
             try:
                 # 分镜分区：每行 = 勾选+分镜号 | 左:智能匹配参考图缩略图 | 右:分镜提示词
                 row = tk.Frame(self.sb_inner, bg=COLOR_PANEL)
@@ -4241,8 +4828,12 @@ class CineMasterUI:
                 chk = tk.Checkbutton(head, variable=var, bg=COLOR_PANEL,
                                      activebackground=COLOR_PANEL)
                 chk.pack(anchor='w')
-                tk.Label(head, text='分镜 ' + str(p['num']), font=('微软雅黑', 9), fg=COLOR_ACCENT,
-                         bg=COLOR_PANEL).pack(anchor='w')
+                # 2026-08-21 点击分镜名称弹出大编辑窗（完整提示词编辑，保存写回该分镜）
+                _sb_idx = _pi
+                _lbl_num = tk.Label(head, text='✎ 分镜 ' + str(p['num']), font=('微软雅黑', 9, 'bold'),
+                                    fg=COLOR_ACCENT, bg=COLOR_PANEL, cursor='hand2')
+                _lbl_num.pack(anchor='w')
+                _lbl_num.bind('<Button-1>', lambda e, _n=_sb_idx: self._open_sb_prompt_editor(_n))
                 # 左：该分镜智能匹配到的参考图缩略图
                 ref_box = tk.Frame(row, bg=COLOR_PANEL)
                 ref_box.pack(side='left', anchor='n', padx=(2, 4), pady=2)
@@ -4252,18 +4843,19 @@ class CineMasterUI:
                     pass
                 # 2026-08-15 需求2：分镜参考图编辑按钮（删除/添加匹配图片）
                 try:
-                    btn_edit_ref = tk.Button(ref_box, text="✎ 编辑匹配", font=(_FONT_CN, 7),
+                    btn_edit_ref = tk.Button(ref_box, text="✎ 编辑匹配", font=("微软雅黑", 7),
                                              bg=COLOR_BORDER, fg=COLOR_TEXT, relief=tk.FLAT,
                                              command=lambda n=str(p['num']): self._open_sb_ref_editor(n))
                     btn_edit_ref.pack(anchor='w', pady=(2, 0))
                     bind_hover(btn_edit_ref, COLOR_BORDER, "#D0D0D0")
                 except Exception:
                     pass
-                # 右：分镜提示词（可编辑）
-                txt = tk.Text(row, height=3, font=FONT_CODE, bg=COLOR_INPUT, fg=COLOR_TEXT,
+                # 右：分镜提示词（2026-08-21 改紧凑 height=2；双击框体也弹出大编辑窗）
+                txt = tk.Text(row, height=2, font=FONT_CODE, bg=COLOR_INPUT, fg=COLOR_TEXT,
                               relief='solid', bd=1, wrap=tk.WORD)
                 txt.insert('1.0', p['prompt'])
                 txt.pack(side='left', fill='x', expand=True, padx=(2, 0))
+                txt.bind('<Double-Button-1>', lambda e, _n=_pi: self._open_sb_prompt_editor(_n))
                 self.story_prompt_vars.append(var)
                 self.story_prompt_texts.append(txt)
                 _render_ok += 1
@@ -4284,6 +4876,76 @@ class CineMasterUI:
                     self.ctx.log('[系统日志] 分镜提示词同步：成功渲染 %d/%d 行\n' % (_render_ok, len(prompts)))
             except Exception:
                 pass
+
+    def _open_sb_prompt_editor(self, idx):
+        """2026-08-21 点击分镜名称/双击提示词框 → 弹出大编辑窗：完整展示提示词，
+        编辑后点「保存」写回该分镜（更新 storyboard_prompts + 行内控件，生成视频即用新内容）"""
+        try:
+            if idx is None or idx < 0 or idx >= len(self.storyboard_prompts):
+                self._show_toast('分镜索引无效', 'warning')
+                return
+            p = self.storyboard_prompts[idx]
+            row_txt = self.story_prompt_texts[idx] if idx < len(self.story_prompt_texts) else None
+            num = p.get('num', idx + 1)
+            cur = row_txt.get('1.0', tk.END).strip() if row_txt else (p.get('prompt') or '')
+
+            dlg = tk.Toplevel(self.root)
+            dlg.title('编辑 分镜%s 提示词' % num)
+            dlg.configure(bg=COLOR_PANEL)
+            dlg.transient(self.root)
+            dlg.geometry('820x620+%d+%d' % (self.root.winfo_x() + 50, self.root.winfo_y() + 50))
+            try:
+                dlg.iconbitmap(resource_path('app.ico'))
+            except Exception:
+                pass
+            dlg.minsize(560, 400)
+
+            tk.Label(dlg, text='分镜%s 完整提示词（编辑后点「保存」写回该分镜）' % num,
+                     font=('微软雅黑', 11, 'bold'), fg=COLOR_ACCENT_DARK, bg=COLOR_PANEL
+                     ).pack(anchor='w', padx=14, pady=(12, 4))
+
+            ed_frame = tk.Frame(dlg, bg=COLOR_PANEL)
+            ed_frame.pack(fill='both', expand=True, padx=14, pady=6)
+            editor = tk.Text(ed_frame, font=FONT_CODE, bg=COLOR_INPUT, fg=COLOR_TEXT,
+                             relief='solid', bd=1, wrap=tk.WORD, undo=True)
+            vsb = tk.Scrollbar(ed_frame, orient='vertical', command=editor.yview)
+            editor.configure(yscrollcommand=vsb.set)
+            vsb.pack(side='right', fill='y')
+            editor.pack(side='left', fill='both', expand=True)
+            editor.insert('1.0', cur)
+            editor.focus_set()
+
+            btns = tk.Frame(dlg, bg=COLOR_PANEL)
+            btns.pack(fill='x', padx=14, pady=(0, 12))
+
+            def _save():
+                new_prompt = editor.get('1.0', tk.END).strip()
+                p['prompt'] = new_prompt
+                if row_txt is not None:
+                    row_txt.delete('1.0', tk.END)
+                    row_txt.insert('1.0', new_prompt)
+                try:
+                    self._auto_save_project()
+                except Exception:
+                    pass
+                self._show_toast('分镜%s 提示词已保存' % num, 'success')
+                dlg.destroy()
+
+            def _save_and_close():
+                _save()
+
+            btn_save = tk.Button(btns, text='✅ 保存', font=('微软雅黑', 10, 'bold'),
+                                 bg=COLOR_ACCENT, fg='#FFFFFF', relief=tk.FLAT, command=_save_and_close)
+            btn_save.pack(side='left', padx=(0, 10))
+            bind_hover(btn_save, COLOR_ACCENT, COLOR_ACCENT_DARK)
+            btn_cancel = tk.Button(btns, text='取消', font=('微软雅黑', 10),
+                                   bg=COLOR_BORDER, fg=COLOR_TEXT, relief=tk.FLAT, command=dlg.destroy)
+            btn_cancel.pack(side='left')
+            bind_hover(btn_cancel, COLOR_BORDER, '#D0D0D0')
+            # Ctrl+S 快捷保存
+            editor.bind('<Control-s>', lambda e: _save())
+        except Exception as e:
+            self._show_toast('打开提示词编辑窗失败: %s' % e, 'error')
 
     def _render_sb_ref_thumbs(self, container, num):
         """在分镜分区左侧渲染该分镜智能匹配到的参考图缩略图（最多9张，48px）"""
@@ -4393,8 +5055,15 @@ class CineMasterUI:
         self._sb_batch_lang = self.combo_vid_lang.get()
         self.btn_gen_vid.config(state=tk.DISABLED)
         self.btn_gen_sb_all.config(state=tk.DISABLED)
+        # 2026-08-21 需求2：记录锁定时间戳（3 分钟超时自动恢复）
+        self._btn_lock_times['gen_vid'] = time.time()
         self.label_vid_status.config(text='分镜视频批量生成中 0/%d ...' % len(prompts))
         self.ctx.log('\n[系统日志] 开始批量生成分镜视频，共 %d 个分镜...\n' % len(prompts))
+        # 2026-08-21 启动即显示"正在生成"跑马灯行
+        try:
+            self._update_video_history_ui()
+        except Exception:
+            pass
         threading.Thread(target=self._sb_video_batch_worker, daemon=True).start()
 
     def _sb_video_batch_worker(self):
@@ -4417,6 +5086,11 @@ class CineMasterUI:
                 self.ctx.log('\n[系统日志] 用户已停止批量生成视频。\n')
                 break
             self._sb_batch_index = idx
+            # 2026-08-21 每镜开始 → 刷新视频历史（顶部显示"正在生成 分镜 X/Y"跑马灯）
+            try:
+                self.root.after(0, self._update_video_history_ui)
+            except Exception:
+                pass
             # 2026-08-09 提示词结构重构（用户要求）：
             #  ①【执行要求+语言要求】前置（H3 对开头指令执行度最高——约束/语言先锁定，杜绝自由发挥/语言漂移）
             #  ②画面描述（英文）+ 台词（内嵌，中文原文）
@@ -4472,13 +5146,22 @@ class CineMasterUI:
                 cfg = self._get_api_config()
                 if prev_video_url:
                     cfg['prev_video_url'] = prev_video_url
+                # 2026-08-21 本地尾帧优先
+                try:
+                    _prev_num = self._story_batch_done
+                    _tail_cand = os.path.join(self._tail_frames_dir(), "分镜%d.png" % _prev_num)
+                    if _prev_num >= 1 and os.path.exists(_tail_cand):
+                        cfg['prev_tail_frame'] = _tail_cand
+                except Exception:
+                    pass
                 # 人物音色：该分镜涉及的人物资产上传的音色（本地路径列表，最多3个）
                 _voices = self._voices_for_storyboard_num(num)
                 if _voices:
                     cfg['ref_audio_paths'] = _voices
                 self.agent.generate_video(prompt, cfg,
                                           dur_eff, ratio, res,
-                                          list(self.pending_video_ref_urls))
+                                          list(self.pending_video_ref_urls),
+                                          local_refs=self._local_paths_for_refs(matched))
                 # generate_video 是异步线程，等待其完成信号（video_done/video_failed 事件递增计数）
                 deadline = time.time() + 2400
                 base = self._story_batch_done
@@ -4528,6 +5211,236 @@ class CineMasterUI:
         self._sb_batch_ok = 0
         self._sb_batch_fail = 0
         self._story_batch_fail_count = 0
+        # 2026-08-21 移除"正在生成"跑马灯行
+        try:
+            self._stop_video_progress_marquee()
+        except Exception:
+            pass
+
+    # ============ 本地控制接口（OpenClaw/QQ 遥控，2026-08-20 新增） ============
+    def _ctrl_submit(self, fn, timeout=15):
+        """在主线程执行 fn（root.after 调度），返回是否已执行。"""
+        ev = threading.Event()
+        def _run():
+            try:
+                fn()
+            except Exception:
+                pass
+            finally:
+                ev.set()
+        try:
+            self.root.after(0, _run)
+            return ev.wait(timeout=timeout)
+        except Exception:
+            return False
+
+    def _gen_in_progress(self):
+        """全链路生成是否进行中（生成按钮禁用 = 在生成）"""
+        try:
+            return str(self.btn_generate.cget('state')) == 'disabled'
+        except Exception:
+            return False
+
+    def ctrl_status(self):
+        try:
+            return {
+                'ok': True,
+                'busy': bool(getattr(self, '_sb_batch_in_progress', False)) or self._gen_in_progress(),
+                'storyboard_count': len(getattr(self, 'storyboard_prompts', []) or []),
+                'video_count': len(getattr(self, 'video_history', []) or []),
+                'last_video': (getattr(self, 'video_history', []) or [None])[-1],
+                'project': (self.current_project or {}).get('name', ''),
+                'port': getattr(self, '_ctrl_port', 8712),
+            }
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
+    def ctrl_export(self):
+        try:
+            vids = list(getattr(self, 'video_history', []) or [])
+            return {'ok': True, 'count': len(vids), 'videos': vids}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
+    def ctrl_stop(self):
+        try:
+            self.ctx.stop_flag = True
+            return {'ok': True, 'stopped': True}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
+    def ctrl_list_projects(self):
+        """列出全部项目（名称/备注/更新时间）"""
+        try:
+            items = self._list_projects()
+            return {'ok': True, 'count': len(items),
+                    'projects': [{'name': p.get('name', ''), 'remark': (p.get('remark') or '')[:50],
+                                  'updated': p.get('updated', '')} for p in items]}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
+    def ctrl_new_project(self, name, remark=''):
+        """新建项目（主线程执行 _create_project）"""
+        name = (name or '').strip()
+        if not name:
+            return {'ok': False, 'error': '项目名为空'}
+        # 重名检查（与对话框逻辑一致）
+        if os.path.exists(self._project_path(name)):
+            return {'ok': False, 'error': '同名项目已存在：%s' % name}
+        ev = threading.Event()
+        result = {}
+        def _run():
+            try:
+                self._create_project(name, (remark or '').strip(), '中国')
+                result['ok'] = True
+            except Exception as e:
+                result['error'] = str(e)
+            finally:
+                ev.set()
+        try:
+            self.root.after(0, _run)
+            if not ev.wait(timeout=15):
+                return {'ok': False, 'error': 'UI 主线程无响应'}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+        if result.get('error'):
+            return {'ok': False, 'error': result['error']}
+        return {'ok': True, 'project': name}
+
+    def ctrl_open_project(self, name):
+        """打开项目（按名字从项目列表匹配）"""
+        name = (name or '').strip()
+        if not name:
+            return {'ok': False, 'error': '项目名为空'}
+        try:
+            items = self._list_projects()
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+        target = None
+        for p in items:
+            if p.get('name') == name:
+                target = p
+                break
+        if target is None:
+            # 模糊匹配：包含
+            for p in items:
+                if name in (p.get('name') or ''):
+                    target = p
+                    break
+        if target is None:
+            return {'ok': False, 'error': '未找到项目：%s（现有：%s）' % (name, '、'.join(p.get('name','') for p in items[:10]) or '无')}
+        ev = threading.Event()
+        result = {}
+        def _run():
+            try:
+                self._load_project(target)
+                result['ok'] = True
+            except Exception as e:
+                result['error'] = str(e)
+            finally:
+                ev.set()
+        try:
+            self.root.after(0, _run)
+            if not ev.wait(timeout=15):
+                return {'ok': False, 'error': 'UI 主线程无响应'}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+        if result.get('error'):
+            return {'ok': False, 'error': result['error']}
+        return {'ok': True, 'project': target.get('name', name)}
+
+    def ctrl_shutdown(self):
+        """关闭 wave漫流 软件（延时让 HTTP 先回响应）"""
+        try:
+            def _quit():
+                try:
+                    self.root.quit()
+                    self.root.destroy()
+                except Exception:
+                    pass
+            self.root.after(500, _quit)
+            return {'ok': True, 'shutdown': True}
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
+
+    def ctrl_generate(self, novel, command=''):
+        """全链路生成：小说 → 剧本/资产/分镜。阻塞到完成（最长 90 分钟）。"""
+        if not novel or not str(novel).strip():
+            return {'ok': False, 'error': 'novel 文本为空'}
+        if self._gen_in_progress():
+            return {'ok': False, 'error': '已有生成任务进行中'}
+        def _submit():
+            try:
+                self.text_input_novel.config(state=tk.NORMAL)
+                self.text_input_novel.delete('1.0', tk.END)
+                self.text_input_novel.insert('1.0', novel)
+            except Exception:
+                pass
+            try:
+                self.text_input_command.config(state=tk.NORMAL)
+                self.text_input_command.delete('1.0', tk.END)
+                self.text_input_command.insert('1.0', command or '')
+            except Exception:
+                pass
+            self._on_generate_click()
+        if not self._ctrl_submit(_submit):
+            return {'ok': False, 'error': '提交失败（UI 主线程无响应）'}
+        time.sleep(1)  # 等 _on_generate_click 重置 _story_gen_done
+        deadline = time.time() + 5400
+        while time.time() < deadline:
+            if self._story_gen_done:
+                break
+            if getattr(self.ctx, 'stop_flag', False):
+                return {'ok': False, 'stopped': True, 'error': '用户已停止'}
+            time.sleep(1)
+        return {
+            'ok': bool(self._story_gen_done),
+            'storyboard_count': len(self.storyboard_prompts),
+            'video_count': len(self.video_history),
+        }
+
+    def ctrl_video(self, nums=None):
+        """生成分镜视频：nums=None 全部；[1,2,3] 指定分镜。阻塞到完成（最长 90 分钟）。"""
+        if getattr(self, '_sb_batch_in_progress', False):
+            return {'ok': False, 'error': '已有视频生成任务进行中'}
+        self._ctrl_video_error = ''
+        def _submit():
+            try:
+                if nums is None:
+                    self._on_gen_all_sb_videos()
+                else:
+                    all_p = self._collect_sb_prompts(selected_only=False)
+                    ns = set()
+                    for x in nums:
+                        try:
+                            ns.add(int(x))
+                        except Exception:
+                            pass
+                    targets = [p for p in all_p if int(p.get('num', -1)) in ns]
+                    if not targets:
+                        self._ctrl_video_error = '没有找到指定分镜: %s（当前共 %d 个分镜）' % (sorted(ns), len(all_p))
+                        return
+                    self._start_sb_video_batch(targets)
+            except Exception as e:
+                self._ctrl_video_error = str(e)
+        if not self._ctrl_submit(_submit):
+            return {'ok': False, 'error': '提交失败（UI 主线程无响应）'}
+        if getattr(self, '_ctrl_video_error', ''):
+            return {'ok': False, 'error': self._ctrl_video_error}
+        base_done = self._story_batch_done
+        base_fail = getattr(self, '_story_batch_fail_count', 0)
+        deadline = time.time() + 5400
+        while time.time() < deadline:
+            if not getattr(self, '_sb_batch_in_progress', False):
+                break
+            if getattr(self.ctx, 'stop_flag', False):
+                return {'ok': False, 'stopped': True, 'error': '用户已停止'}
+            time.sleep(1)
+        fail_delta = getattr(self, '_story_batch_fail_count', 0) - base_fail
+        done_delta = self._story_batch_done - base_done
+        success = max(0, done_delta - fail_delta)
+        return {'ok': True, 'success': success, 'fail': fail_delta,
+                'total': len(self.storyboard_prompts)}
 
     # ============ 资产图匹配（分镜→资产图）============
     def _build_asset_match_area(self, parent):
@@ -4566,7 +5479,7 @@ class CineMasterUI:
                 w.destroy()
             tk.Label(self.asset_inner,
                      text='（暂无资产图。\n请先生成分镜与资产图片，然后点击"🔄 重新同步"）',
-                     font=(_FONT_CN, 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL,
+                     font=("微软雅黑", 9), fg=COLOR_TEXT_DIM, bg=COLOR_PANEL,
                      justify="left").pack(anchor="w", pady=8, padx=10)
             self.asset_canvas.configure(scrollregion=self.asset_canvas.bbox("all"))
         except Exception:
@@ -5258,6 +6171,52 @@ class CineMasterUI:
             pass
         return []
 
+    def _save_asset_image_local(self, pil_img, name, chapter=''):
+        """2026-08-21 资产图本地落盘：保存到 项目目录/assets/，返回本地路径（失败返回 ''）。"""
+        try:
+            if pil_img is None:
+                return ''
+            d = self._assets_dir()
+            safe = re.sub(r'[\\/:*?"<>|]', "_", str(name or "asset")).strip() or "asset"
+            if chapter and chapter != "全部章节":
+                safe = "%s_%s" % (safe, re.sub(r'[\\/:*?"<>|]', "_", str(chapter)).strip()[:20])
+            path = os.path.join(d, safe + ".png")
+            buf = io.BytesIO()
+            pil_img.convert('RGB').save(buf, format='PNG')
+            with open(path, 'wb') as f:
+                f.write(buf.getvalue())
+            return path
+        except Exception:
+            return ''
+
+    def _local_paths_for_refs(self, matched):
+        """2026-08-21 从匹配的参考图（url,name,type 或 dict）中收集本地路径列表。"""
+        out = []
+        try:
+            for m in matched:
+                _lp = ''
+                if isinstance(m, dict):
+                    _lp = m.get('local_path') or ''
+                    _nm = m.get('name') or ''
+                else:
+                    _url, _nm = m[0], m[1]
+                    for _it in self.image_history:
+                        if _it.get('name') == _nm and _it.get('local_path'):
+                            _lp = _it.get('local_path')
+                            break
+                if _lp and os.path.exists(_lp):
+                    out.append(_lp)
+                    continue
+                if _nm:
+                    _cand = os.path.join(self._assets_dir(), re.sub(r'[\\/:*?"<>|]', "_", str(_nm)) + ".png")
+                    if os.path.exists(_cand):
+                        out.append(_cand)
+                        continue
+                out.append('')
+        except Exception:
+            pass
+        return out
+
     def _rebuild_asset_match_area(self):
         """重建资产图匹配区域 UI"""
         if not hasattr(self, 'asset_inner'):
@@ -5273,12 +6232,12 @@ class CineMasterUI:
             assets = [a for a in ln.get('assets', []) if a]
             row_title = tk.Frame(self.asset_inner, bg=COLOR_PANEL)
             row_title.pack(fill="x", padx=6, pady=(4, 0))
-            tk.Label(row_title, text="分镜 %s：" % num, font=(_FONT_CN, 9, "bold"),
+            tk.Label(row_title, text="分镜 %s：" % num, font=("微软雅黑", 9, "bold"),
                      fg=COLOR_ACCENT, bg=COLOR_PANEL).pack(side="left")
-            tk.Label(row_title, text="%d 个资产" % len(assets), font=(_FONT_CN, 8),
+            tk.Label(row_title, text="%d 个资产" % len(assets), font=("微软雅黑", 8),
                      fg=COLOR_TEXT_DIM, bg=COLOR_PANEL).pack(side="left", padx=6)
             if not assets:
-                tk.Label(row_title, text="（分镜中未匹配到已生成的资产图）", font=(_FONT_CN, 8),
+                tk.Label(row_title, text="（分镜中未匹配到已生成的资产图）", font=("微软雅黑", 8),
                          fg=COLOR_TEXT_DIM, bg=COLOR_PANEL).pack(side="left", padx=6)
                 continue
             row = tk.Frame(self.asset_inner, bg=COLOR_PANEL)
@@ -5308,10 +6267,10 @@ class CineMasterUI:
         if ph:
             cv.create_image(42, 42, image=ph)
         else:
-            cv.create_text(42, 42, text="无图", fill=COLOR_TEXT_DIM, font=(_FONT_CN, 8))
+            cv.create_text(42, 42, text="无图", fill=COLOR_TEXT_DIM, font=("微软雅黑", 8))
         _type_label = {'character': '人物', 'prop': '道具', 'scene': '场景'}.get(item.get('type', ''), '')
         _show_core = (_type_label + '·' + core) if _type_label else core
-        cv.create_text(42, 80, text=_show_core, fill=COLOR_TEXT_DIM, font=(_FONT_CN, 7), anchor="s")
+        cv.create_text(42, 80, text=_show_core, fill=COLOR_TEXT_DIM, font=("微软雅黑", 7), anchor="s")
         # 左上角选择框
         var = tk.BooleanVar(value=False)
         self._asset_checked[core] = var
@@ -5320,10 +6279,10 @@ class CineMasterUI:
         chk.place(x=0, y=0)
         # 操作按钮行（默认隐藏）
         btns = tk.Frame(cell, bg=COLOR_PANEL)
-        btn_re = tk.Button(btns, text="🔄", font=(_FONT_CN, 8), bg="#F0A500", fg="white",
+        btn_re = tk.Button(btns, text="🔄", font=("微软雅黑", 8), bg="#F0A500", fg="white",
                            relief="flat", padx=4, command=lambda c=core: self._regenerate_asset_image(c))
         btn_re.pack(side="left", padx=1)
-        btn_del = tk.Button(btns, text="🗑", font=(_FONT_CN, 8), bg="#D63027", fg="white",
+        btn_del = tk.Button(btns, text="🗑", font=("微软雅黑", 8), bg="#D63027", fg="white",
                             relief="flat", padx=4, command=lambda c=core: self._delete_asset_image(c))
         btn_del.pack(side="left", padx=1)
         btns.pack(side="top", pady=(1, 0))
@@ -5349,13 +6308,13 @@ class CineMasterUI:
             _vpath = (self.asset_voices or {}).get(core, '')
             if _vpath and os.path.exists(_vpath):
                 _vname = os.path.basename(_vpath)
-                tk.Label(vrow, text='🎵 ' + _vname[:8], font=(_FONT_CN, 7),
+                tk.Label(vrow, text='🎵 ' + _vname[:8], font=("微软雅黑", 7),
                          fg=COLOR_SUCCESS, bg=COLOR_PANEL).pack(side="left")
-                tk.Button(vrow, text="✕", font=(_FONT_CN, 7), bg=COLOR_PANEL,
+                tk.Button(vrow, text="✕", font=("微软雅黑", 7), bg=COLOR_PANEL,
                           fg=COLOR_DANGER, relief="flat", padx=2,
                           command=lambda c=core: self._clear_asset_voice(c)).pack(side="left")
             else:
-                tk.Button(vrow, text="🎵 音色", font=(_FONT_CN, 7), bg=COLOR_PANEL,
+                tk.Button(vrow, text="🎵 音色", font=("微软雅黑", 7), bg=COLOR_PANEL,
                           fg=COLOR_ACCENT, relief="solid", bd=1, highlightbackground=COLOR_BORDER,
                           padx=4, command=lambda c=core: self._upload_asset_voice(c)).pack(side="left")
         # 记录以便控制显隐
@@ -5370,8 +6329,8 @@ class CineMasterUI:
                        highlightcolor=COLOR_ACCENT)
         cv.pack(side="top")
         cv.create_rectangle(6, 6, 78, 78, outline="#AAAAAA", dash=(3, 3))
-        cv.create_text(42, 36, text="点击上传", fill=COLOR_TEXT_DIM, font=(_FONT_CN, 8))
-        cv.create_text(42, 52, text=core, fill=COLOR_TEXT_DIM, font=(_FONT_CN, 7))
+        cv.create_text(42, 36, text="点击上传", fill=COLOR_TEXT_DIM, font=("微软雅黑", 8))
+        cv.create_text(42, 52, text=core, fill=COLOR_TEXT_DIM, font=("微软雅黑", 7))
         cv.bind("<Button-1>", lambda e, c=core: self._upload_asset_image(c))
         cv.configure(cursor="hand2")
 
@@ -5642,7 +6601,7 @@ class CineMasterUI:
         if not path:
             return
         try:
-            vdir = os.path.join(os.environ.get('TMPDIR', os.environ.get('TEMP', os.getcwd())), 'CineMaster_Voices')
+            vdir = os.path.join(os.environ.get('TEMP', os.getcwd()), 'CineMaster_Voices')
             os.makedirs(vdir, exist_ok=True)
             ext = os.path.splitext(path)[1].lower() or '.wav'
             dst = os.path.join(vdir, 'voice_%s_%s%s' % (core, int(time.time()), ext))
@@ -5795,11 +6754,21 @@ class CineMasterUI:
                     if 'btn_gen_img' in edata:
                         self.btn_gen_img.config(state=edata['btn_gen_img'])
                         self.btn_gen_images_batch.config(state=edata['btn_gen_img'])
+                        # 2026-08-21 需求2：禁用时记录时间戳，3分钟超时自动恢复（防 ComfyUI 卡死导致按钮永远灰）
+                        if edata['btn_gen_img'] == 'disabled':
+                            self._btn_lock_times['gen_img'] = time.time()
+                        else:
+                            self._btn_lock_times.pop('gen_img', None)
                     if 'btn_gen_vid' in edata:
                         self.btn_gen_vid.config(state=edata['btn_gen_vid'])
                         # 同步恢复"生成全部分镜视频"按钮（修复：原只恢复 btn_gen_vid，
                         # 批量开始禁用后若异常中断，btn_gen_sb_all 永远灰色）
                         self.btn_gen_sb_all.config(state=edata['btn_gen_vid'])
+                        # 2026-08-21 需求2：记录时间戳
+                        if edata['btn_gen_vid'] == 'disabled':
+                            self._btn_lock_times['gen_vid'] = time.time()
+                        else:
+                            self._btn_lock_times.pop('gen_vid', None)
                     if edata.get('progress') == False:
                         self.progress_bar.stop()
                     if 'img_status_text' in edata:
@@ -5812,10 +6781,60 @@ class CineMasterUI:
         self.root.after(50, self._process_ui_queue)
 
     def _handle_stream(self, text):
-        if '[ALL_DONE]' in text:
-            # 全部生成完成：延迟等缓冲刷新后自动同步分镜提示词
-            self.root.after(800, self._safe_sync_storyboard)
+        # 2026-08-21 标记跨 chunk 拆分修复：LLM 流式输出时 [STAGE1_DONE] 等标记可能
+        # 被拆成多个 chunk（如 "[STAGE" + "1_DONE]"），单 chunk 检测会漏。
+        # 累积最近文本到 _stream_marker_buf，用累积内容检测标记。
+        try:
+            _buf = getattr(self, '_stream_marker_buf', '') + text
+            if len(_buf) > 200:
+                _buf = _buf[-200:]
+            self._stream_marker_buf = _buf
+        except Exception:
+            _buf = text
+        # 2026-08-21 修复：LLM 可能混用 [ALL_DONE] 代替阶段标记（[STAGE1_DONE]/[STAGE2_DONE]）。
+        # 收到 [ALL_DONE] 时，若当前处于分段评级模式（_gen_stage=1/2），把它转成当前阶段标记触发评级；
+        # 仅当 _gen_stage=3（剪辑段）或非分段模式时，才当作"全部完成"。
+        _gen_stage_now = getattr(self, '_gen_stage', 0) or 0
+        _detect_text = _buf
+        if '[ALL_DONE]' in _detect_text:
+            if _gen_stage_now == 1:
+                # 2026-08-21 只有剧本段（stage=1）才把 [ALL_DONE] 转 [STAGE1_DONE] 触发评级；
+                # 资产段/分镜段用独立标记（ASSETS_DONE/STAGE2_DONE），残留 ALL_DONE 不触发
+                _conv = '[STAGE1_DONE]'
+                # 转成阶段标记：触发评级（延迟等缓冲刷新；防重复：已评级过的阶段不再触发）
+                if _conv not in getattr(self, '_stage_review_done', set()):
+                    self._pending_stage_after = self.root.after(
+                        1500, lambda m=_conv: self._on_stage_complete(m))
+                text = text.replace('[ALL_DONE]', _conv)
+                self._stream_marker_buf = ''
+            else:
+                # 全部生成完成：延迟等缓冲刷新后自动同步分镜提示词
+                self.root.after(800, self._safe_sync_storyboard)
+                # 2026-08-21 续写功能：仅第三段（剪辑 [ALL_DONE]）真正完成时推进集数记录
+                if _gen_stage_now == 3:
+                    self.root.after(1500, self._advance_episode)
+                self._stream_marker_buf = ''
         text = text.replace('[ALL_DONE]', '')
+        # 2026-08-21 评级功能：检测阶段结束标记 → 触发评级（用累积 buffer 检测，防跨 chunk 拆分）
+        _stage_marker = ''
+        if '[ASSETS_DONE]' in _detect_text:
+            _stage_marker = '[ASSETS_DONE]'
+        elif '[STAGE1_DONE]' in _detect_text:
+            _stage_marker = '[STAGE1_DONE]'
+        elif '[STAGE2_DONE]' in _detect_text:
+            _stage_marker = '[STAGE2_DONE]'
+        if _stage_marker:
+            # 延迟等缓冲刷新（行缓冲可能还有未刷的行），再触发评级
+            if _stage_marker == '[ASSETS_DONE]':
+                if _stage_marker not in getattr(self, '_stage_review_done', set()):
+                    self._pending_stage_after = self.root.after(1500, lambda: self._on_assets_complete())
+            else:
+                # 防重复：同一阶段标记只评级一次（避免残留 chunk/回调导致二次评级）
+                if _stage_marker not in getattr(self, '_stage_review_done', set()):
+                    self._pending_stage_after = self.root.after(
+                        1500, lambda m=_stage_marker: self._on_stage_complete(m))
+            text = text.replace(_stage_marker, '')
+            self._stream_marker_buf = ''
         self._append_text('all', text)
         self.line_buffer += text
         # 兜底：分镜段已完整出现（有"===== 分镜 N"且含【自检】/【画面与视听细节】）但 [ALL_DONE] 未到
@@ -5936,15 +6955,17 @@ class CineMasterUI:
                 regen_prompt_cn = getattr(self, '_regen_prompt_cn', '') or old.get('prompt_cn', '') or _prompt_cn
                 self._regen_prompt = ''
                 self._regen_prompt_cn = ''
+                _local = self._save_asset_image_local(pil_img, old.get('name', name), old.get('chapter', chapter))
                 self.image_history[regen_idx] = {'url': url, 'img': pil_img, 'name': old.get('name', name),
                                                  'prompt': regen_prompt, 'type': old.get('type', atype),
                                                  'chapter': old.get('chapter', chapter),
-                                                 'prompt_cn': regen_prompt_cn}
+                                                 'prompt_cn': regen_prompt_cn, 'local_path': _local}
                 self._regen_hist_idx = None
             else:
+                _local = self._save_asset_image_local(pil_img, name, chapter)
                 self.image_history.append({'url': url, 'img': pil_img, 'name': name,
                                            'prompt': prompt, 'type': atype, 'chapter': chapter,
-                                           'prompt_cn': _prompt_cn})
+                                           'prompt_cn': _prompt_cn, 'local_path': _local})
                 if len(self.image_history) > 500:
                     self.image_history.pop(0)
                     # 溢出删除首项后，选中索引整体左移
@@ -5974,11 +6995,156 @@ class CineMasterUI:
         self.video_history.append(url)
         if len(self.video_history) > 500:
             self.video_history.pop(0)
+        # 2026-08-21 需求：生成完自动下载保存到本地（videos/ 目录）
+        try:
+            if not hasattr(self, '_video_local_paths') or self._video_local_paths is None:
+                self._video_local_paths = {}
+        except Exception:
+            self._video_local_paths = {}
         self._update_video_history_ui()
         self._story_batch_done += 1  # 批量生成计数（供批量 worker 等待）
+        _sb_num = self._story_batch_done
+        # 2026-08-21 后台下载视频到本地正式目录（videos/分镜N_时间戳.mp4）
+        try:
+            threading.Thread(target=self._save_video_local, args=(url, _sb_num), daemon=True).start()
+        except Exception:
+            pass
+        # 2026-08-21 尾帧本地落盘：视频生成完成 → 后台抽最后一帧存 tail_frames/
+        try:
+            threading.Thread(target=self._save_video_tail_frame, args=(url, _sb_num), daemon=True).start()
+        except Exception:
+            pass
         # 批量生成中不逐个弹 toast（全部完成时统一提示）
         if not getattr(self, '_sb_batch_in_progress', False):
-            self._show_toast('视频生成成功！可在下方历史记录中播放或下载。', 'success')
+            self._show_toast('视频生成成功！已自动保存到本地，可在下方历史记录中播放或下载。', 'success')
+
+    def _save_video_local(self, url, sb_num):
+        """2026-08-21 自动下载视频到 项目目录/videos/，记录本地路径供预览/删除使用。"""
+        try:
+            if not url:
+                return
+            d = self._videos_dir()
+            ts = time.strftime('%Y%m%d_%H%M%S')
+            out = os.path.join(d, "分镜%d_%s.mp4" % (sb_num, ts))
+            # 已存在同名分镜的最新文件则跳过重复下载（同一 URL 只存一份）
+            if os.path.exists(out) and os.path.getsize(out) > 0:
+                self._video_local_paths[url] = out
+                return
+            _resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=180, verify=False)
+            _resp.raise_for_status()
+            with open(out, 'wb') as _f:
+                _f.write(_resp.content)
+            if os.path.exists(out) and os.path.getsize(out) > 0:
+                self._video_local_paths[url] = out
+                # 下载完成 → 刷新列表（行内可显示本地状态）
+                try:
+                    self.root.after(0, self._update_video_history_ui)
+                except Exception:
+                    pass
+                # 2026-08-21 hover 预览帧：后台 ffmpeg 抽帧（存 项目/assets/video_previews/分镜N/）
+                try:
+                    threading.Thread(target=self._extract_preview_frames,
+                                     args=(url, out, sb_num), daemon=True).start()
+                except Exception:
+                    pass
+            self.ctx.log('\n[系统日志] 视频已自动保存到本地: %s\n' % out)
+        except Exception as e:
+            self.ctx.log('\n[系统日志] 视频本地保存失败: %s\n' % e)
+
+    def _extract_preview_frames(self, url, local_path, sb_num):
+        """2026-08-21 用 ffmpeg 抽前 6 秒预览帧（固定 360x202，pad 黑边），存 PNG 供 hover 秒开预览。
+        替代 opencv：无解码延迟、无临时缓存冗余。"""
+        try:
+            if not url or not local_path or not os.path.exists(local_path):
+                return
+            import imageio_ffmpeg
+            import subprocess as _sp
+            import glob
+            _ff = imageio_ffmpeg.get_ffmpeg_exe()
+            _previews = os.path.join(self._preview_frames_dir(), "分镜%d" % sb_num)
+            os.makedirs(_previews, exist_ok=True)
+            # 清掉旧帧（重新生成时覆盖）
+            for _old in glob.glob(os.path.join(_previews, 'f_*.png')):
+                try:
+                    os.remove(_old)
+                except Exception:
+                    pass
+            # 前 6 秒 @ 4fps = 24 帧，固定 360x202（16:9，pad 黑边）→ 窗口不跳动
+            _vf = 'fps=4,scale=360:202:force_original_aspect_ratio=decrease,pad=360:202:(ow-iw)/2:(oh-ih)/2:black'
+            _r = _sp.run([_ff, '-y', '-i', local_path, '-t', '6', '-vf', _vf,
+                          os.path.join(_previews, 'f_%03d.png')],
+                         capture_output=True, timeout=90)
+            _files = sorted(glob.glob(os.path.join(_previews, 'f_*.png')))
+            if _files:
+                self._video_preview_frames[url] = _previews
+                # 若鼠标仍悬停 → 立即播放（帧已就绪）
+                if getattr(self, '_preview_hover_active', False):
+                    self.root.after(0, lambda: self._play_preview_frames(_previews))
+                self.ctx.log('\n[系统日志] 视频预览帧已生成: %s (%d 帧)\n' % (_previews, len(_files)))
+        except Exception as e:
+            self.ctx.log('\n[系统日志] 视频预览帧生成失败: %s\n' % e)
+
+    def _save_video_tail_frame(self, url, sb_num):
+        """2026-08-21 下载视频并提取最后一帧，保存到 项目目录/assets/tail_frames/分镜N.png。"""
+        try:
+            if not url:
+                return
+            import subprocess as _sp
+            # 2026-08-21 优先用已自动保存的本地视频（避免重复下载）
+            _local_vid = ''
+            try:
+                # 等待本地保存线程完成（最多 15 秒），避免两个线程重复下载同一 URL
+                for _w in range(15):
+                    _local_vid = (getattr(self, '_video_local_paths', {}) or {}).get(url, '')
+                    if _local_vid and os.path.exists(_local_vid):
+                        break
+                    if _w < 14:
+                        time.sleep(1)
+                if _local_vid and not os.path.exists(_local_vid):
+                    _local_vid = ''
+            except Exception:
+                _local_vid = ''
+            if _local_vid:
+                _tmp = _local_vid
+            else:
+                _tmp = os.path.join(os.environ.get('TEMP', '.'), 'wave_tail_%d.mp4' % int(time.time()))
+                _resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=120, verify=False)
+                _resp.raise_for_status()
+                with open(_tmp, 'wb') as _f:
+                    _f.write(_resp.content)
+            _out = os.path.join(self._tail_frames_dir(), "分镜%d.png" % sb_num)
+            _done = False
+            for _ff in ('ffmpeg', r'C:\ffmpeg\bin\ffmpeg.exe', r'D:\ffmpeg\bin\ffmpeg.exe'):
+                try:
+                    _r = _sp.run([_ff, '-y', '-i', _tmp, '-vf', 'select=eq(n\\,N)', '-vframes', '1', _out],
+                                 capture_output=True, timeout=120)
+                    if _r.returncode == 0 and os.path.exists(_out) and os.path.getsize(_out) > 1000:
+                        _done = True
+                        break
+                except Exception:
+                    continue
+            if not _done:
+                try:
+                    from PIL import ImageSequence
+                    _im = Image.open(_tmp)
+                    _last = None
+                    for _fr in ImageSequence.Iterator(_im):
+                        _last = _fr.copy()
+                    if _last is not None:
+                        _last.convert('RGB').save(_out, 'PNG')
+                        _done = True
+                except Exception:
+                    pass
+            if _done:
+                self.ctx.log("[系统日志] 分镜%d 尾帧已保存到本地: %s\n" % (sb_num, _out))
+            # 仅清理临时下载（本地正式文件不删）
+            try:
+                if not _local_vid and os.path.exists(_tmp):
+                    os.remove(_tmp)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     # ============ 开始/停止 ============
     def _on_generate_click(self):
@@ -5987,6 +7153,45 @@ class CineMasterUI:
         if not novel:
             self._show_toast('请输入小说文本', 'warning')
             return
+        # ============ 2026-08-21 续写下一集模式 ============
+        # 勾选「续写下一集」→ 检测第 N 集资产已生成 → 自动开始第 N+1 集生成。
+        # 必须在本函数清空 text_widgets 之前检测（要用上一集剧本结尾作续写上下文）。
+        _continue_mode = bool(getattr(self, '_continue_var', None) and self._continue_var.get())
+        self._continue_episode_target = 0  # 非续写=0；续写时=目标集数
+        self._continue_prev_tail = ''      # 上一集剧本结尾（续写上下文）
+        if _continue_mode:
+            _secs = (self.current_project or {}).get('sections', {}) or {}
+            _prev_script = ''
+            try:
+                _w = self.text_widgets.get('script')
+                if _w is not None:
+                    _prev_script = _w.get('1.0', tk.END).strip()
+                if not _prev_script:
+                    _prev_script = str(_secs.get('script') or '').strip()
+            except Exception:
+                _prev_script = str(_secs.get('script') or '').strip()
+            # 检测上一集资产是否已生成（角色/场景/道具任一非空即视为已生成）
+            _assets_done = any(
+                ((_secs.get(k) or '').strip() or
+                 (self.text_widgets.get(k).get('1.0', tk.END).strip() if self.text_widgets.get(k) else ''))
+                for k in ('character', 'scene', 'prop'))
+            if not _assets_done:
+                self._show_toast('⚠️ 未检测到已生成的资产（角色/场景/道具），无法续写。\n'
+                                 '请先完成第 1 集的全链路生成，再勾选「续写下一集」。', 'warning')
+                return
+            _ep = int((self.current_project or {}).get('episode', 0) or 0)
+            _episode_target = (_ep if _ep >= 1 else 1) + 1  # 资产存在 → 至少完成过第1集
+            self._continue_episode_target = _episode_target
+            # 提取上一集剧本正文结尾（800字）作为续写锚点
+            if _prev_script:
+                try:
+                    _m = re.search(r'----- B\. 剧本正文 -----(.*)', _prev_script, re.S)
+                    _body = _m.group(1).strip() if _m else _prev_script
+                    self._continue_prev_tail = _body[-800:]
+                except Exception:
+                    self._continue_prev_tail = _prev_script[-800:]
+            self.ctx.log('[系统日志] ⏭ 续写模式：检测到第 %d 集资产已生成，本次自动生成第 %d 集（从上一集结尾继续）\n'
+                         % (_episode_target - 1, _episode_target))
         self.ctx.stop_flag = False
         self.line_buffer = ''
         self.current_section = 'script'
@@ -6068,11 +7273,862 @@ class CineMasterUI:
                 '3. 然后按原有全链路流程继续：基于你创作的小说原文，输出【剧本信息】【A. 剧本基础角色资产】【B. 剧本正文】'
                 '（第1集，按时长截取）、【C. 角色资产】【D. 场景资产】【E. 道具资产】、分镜【F】、剪辑方案【G】。\n'
                 '4. 资产硬清单校验铁律照常执行（以你创作的剧本正文为硬清单）。\n'
-                '5. 全程禁止询问用户确认，一次性输出全部内容；创作的小说不单独输出给用户看，直接并入剧本正文流程。\n')
+                '5. 遵守三段式分段输出：本段（剧本）只输出【剧本信息】【A. 剧本基础角色资产】【B. 剧本正文】'
+                '（含你创作的底本内容），末尾输出 [STAGE1_DONE]；后续资产/分镜/剪辑按软件指令分段输出。\n')
             system_prompt = system_prompt.rstrip() + create_inst
+        # 2026-08-21 续写下一集：注入集数替换 + 续写指令（在导演/风格/地域/创作模式注入之后统一处理）
+        if _continue_mode:
+            _ep_t = self._continue_episode_target or 2
+            # 1) SP 中写死的集数动态化
+            system_prompt = system_prompt.replace('第1集', '第%d集' % _ep_t)
+            system_prompt = system_prompt.replace('是否继续生成第2集？', '是否继续生成第%d集？' % (_ep_t + 1))
+            system_prompt = system_prompt.replace(
+                '从小说开头推进剧情',
+                '从上一集（第%d集）剧情结束处继续推进剧情，严禁从头开始、严禁重复或改写上一集已生成内容'
+                % (_ep_t - 1))
+            # 2) 注入续写模式规则（最高优先级，位于 SP 末尾）
+            _cont_inst = (
+                '\n# 续写模式（本次为第%d集自动续写）\n'
+                '本次生成是【第%d集】的续写，上一集（第%d集）的剧本/资产/分镜已生成完毕。必须遵守：\n'
+                '1. 【B. 剧本正文】必须从上一集剧情结束处（见用户消息【续写上下文】）自然衔接继续推进，'
+                '严禁从头开始、严禁重复或改写上一集已生成内容；全局理解仍通读整本小说，'
+                '但本集只截取上一集之后的新剧情（同样遵守单集时长上限）。\n'
+                '2. 资产生成（C/D/E）唯一来源=本集【B. 剧本正文】；与上一集相同的人物/场景/道具'
+                '（如主角、常驻场景）仍须生成本集对应的完整资产卡（保证本集资产可独立使用），'
+                '严禁从小说全文提取本集未涉及的新增资产。\n'
+                '3. 分镜与剪辑照常按本集内容生成，分镜衔接以上一集结尾状态为起点。\n'
+                '4. 所有阶段标记（[STAGE1_DONE]/[ASSETS_DONE]/[STAGE2_DONE]/[ALL_DONE]）照常输出。'
+                % (_ep_t, _ep_t, _ep_t - 1))
+            system_prompt = system_prompt.rstrip() + _cont_inst
+            # 3) 上一集剧本结尾注入附加指令（贯穿所有阶段：_gen_command_text 被各阶段复用）
+            _prev_tail = getattr(self, '_continue_prev_tail', '') or ''
+            if _prev_tail:
+                _ctx = ('\n\n【续写上下文】上一集（第%d集）剧本结尾（本集必须从这里继续，严禁从头开始）：\n%s'
+                        % (_ep_t - 1, _prev_tail))
+                command_text = (command_text or '') + _ctx
+        # 2026-08-21 评级功能：初始化为阶段①（剧本），stop_marker=[STAGE1_DONE]
+        self._gen_stage = 1
+        self._gen_novel_text = novel
+        self._gen_command_text = command_text
+        self._gen_system_prompt = system_prompt
+        self._gen_review_text = ''  # 上一轮评级意见（重新生成时携带）
+        # 2026-08-21 防重复评级：新生成重置阶段标记记录与挂起回调
+        try:
+            self._stage_review_done = set()
+            if getattr(self, '_pending_stage_after', None) is not None:
+                try:
+                    self.root.after_cancel(self._pending_stage_after)
+                except Exception:
+                    pass
+                self._pending_stage_after = None
+        except Exception:
+            pass
         self.agent.generate_storyboard(novel,
                                        command_text,
-                                       self._get_api_config(), system_prompt)
+                                       self._get_api_config(), system_prompt,
+                                       stop_marker='[STAGE1_DONE]',
+                                       extra_context='')
+
+
+    # ============ 2026-08-21 分段评级（Toonflow 机制：生成→评级→用户确认→下一步）============
+    def _on_stage_complete(self, marker):
+        """阶段生成完成标记触发：STAGE1=剧本评级；STAGE2=分镜评级"""
+        try:
+            # 2026-08-21 防重复：清空挂起回调，标记该阶段已评级
+            try:
+                if getattr(self, '_pending_stage_after', None) is not None:
+                    self.root.after_cancel(self._pending_stage_after)
+                    self._pending_stage_after = None
+            except Exception:
+                pass
+            try:
+                self._stage_review_done.add(marker)
+            except Exception:
+                pass
+            # 生成线程已结束，先确保按钮状态正确（btn_generate 保持可用）
+            self.progress_bar.stop()
+            self.btn_stop.config(state=tk.DISABLED)
+            if marker == '[STAGE1_DONE]':
+                self._gen_stage = 1
+                self._trigger_review('script')
+            elif marker == '[STAGE2_DONE]':
+                self._gen_stage = 2
+                self._trigger_review('storyboard')
+        except Exception as e:
+            self.ctx.log('\n[系统日志] 阶段完成处理异常: %s\n' % e)
+            # 2026-08-21 兜底：即使评级链路异常，也要弹出评级窗口（带错误信息），
+            # 保证用户一定能看到"需要确认"的界面，绝不静默卡住
+            try:
+                _rt = 'script' if marker == '[STAGE1_DONE]' else 'storyboard'
+                self._show_review_dialog(_rt, None)
+            except Exception:
+                pass
+
+    def _trigger_review(self, review_type):
+        """触发监督层评级：先弹"评级中"窗口（立即反馈），后台线程调用 LLM 评级完成后填充结果"""
+        self.label_gen_time.config(text='正在评级 ' + ('剧本' if review_type == 'script' else '分镜') + ' ...')
+        self.ctx.log('\n[系统日志] 正在评级%s...\n' % ('剧本' if review_type == 'script' else '分镜'))
+        # 2026-08-21 先弹出"评级中"窗口，避免用户以为卡死无反馈
+        _win = self._show_review_loading(review_type)
+
+        def _worker():
+            try:
+                api_config = self._get_api_config()
+                # 收集当前阶段产出文本
+                if review_type == 'script':
+                    _content = ''
+                    try:
+                        _content += (self.text_widgets.get('script').get('1.0', tk.END) or '')
+                    except Exception:
+                        pass
+                    _dims = REVIEW_SCRIPT_DIMENSIONS
+                else:
+                    # 2026-08-21 修复：原逻辑按 character→scene→prop→global_plan→storyboard 顺序拼接后
+                    # 整体 [:8000]——C/D/E 资产卡把 8000 字额度占满，分镜内容全被截掉 → 评级报告误报
+                    # "分镜完全缺失"。改为分段组织：分镜（global_plan+storyboard）完整优先传入，
+                    # C/D/E 资产卡截断放后面作辅助分析（帮助评级校验"资产调用一致"维度）。
+                    _sb_content = ''
+                    for _k in ('global_plan', 'storyboard'):
+                        try:
+                            _sb_content += (self.text_widgets.get(_k).get('1.0', tk.END) or '') + '\n'
+                        except Exception:
+                            pass
+                    _assets_content = ''
+                    for _k in ('character', 'scene', 'prop'):
+                        try:
+                            _assets_content += (self.text_widgets.get(_k).get('1.0', tk.END) or '') + '\n'
+                        except Exception:
+                            pass
+                    # 分镜内容优先且保证完整（最多 12000 字），资产卡截断（最多 6000 字）作辅助
+                    _content = ('【分镜全局规划 + F 段分镜资产】\n' + (_sb_content[:12000] if _sb_content.strip() else '（无分镜内容！）') +
+                                '\n\n【C/D/E 资产卡（辅助分析用，供校验分镜资产调用一致性）】\n' +
+                                (_assets_content[:6000] if _assets_content.strip() else '（无资产内容）'))
+                    _dims = REVIEW_STORYBOARD_DIMENSIONS
+                _prompt = (_dims + '\n\n【产出物】\n' +
+                           _content +
+                           '\n\n请按上述审核维度输出审核报告，评分 A/B/C/D，列出问题清单。')
+                _report = self.agent.review_output(api_config, _prompt, REVIEW_SYSTEM_PROMPT)
+                self.root.after(0, lambda: self._fill_review_dialog(_win, review_type, _report))
+            except Exception as e:
+                self.ctx.log('\n[系统日志] 评级异常: %s\n' % e)
+                self.root.after(0, lambda: self._fill_review_dialog(_win, review_type, None))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _show_review_loading(self, review_type):
+        """先弹"评级中"窗口（loading 态），评级完成后由 _fill_review_dialog 填充"""
+        _name = '剧本' if review_type == 'script' else '分镜（全局规划+分镜资产）'
+        win = tk.Toplevel(self.root)
+        win.title('评级：%s' % _name)
+        win.configure(bg='#FFFFFF')
+        win.geometry('720x560')
+        win.transient(self.root)
+        win.grab_set()
+        head = tk.Frame(win, bg='#FFFFFF')
+        head.pack(fill='x', padx=16, pady=(14, 4))
+        tk.Label(head, text='评级报告 · %s' % _name, font=('微软雅黑', 13, 'bold'),
+                 bg='#FFFFFF', fg='#2C3E50').pack(anchor='w')
+        # loading 提示
+        _load = tk.Frame(win, bg='#FFFFFF')
+        _load.pack(fill='both', expand=True, padx=16, pady=10)
+        tk.Label(_load, text='⏳ 正在评级中，请稍候...（正在调用 AI 评审专家审核本阶段产出物）',
+                 font=('微软雅黑', 12), bg='#FFFFFF', fg='#7F8C8D').pack(pady=30)
+        # 报告文本（先空，评级完成后填充）
+        txt = scrolledtext.ScrolledText(win, font=('微软雅黑', 10), wrap='word',
+                                        bg='#FBFCFC', fg='#2C3E50', relief='solid', bd=1)
+        txt.pack(fill='both', expand=True, padx=16, pady=10)
+        txt.config(state=tk.DISABLED)
+        win._review_txt = txt
+        win.update_idletasks()
+        try:
+            _x = self.root.winfo_x() + max(0, (self.root.winfo_width() - 720) // 2)
+            _y = self.root.winfo_y() + max(0, (self.root.winfo_height() - 560) // 2)
+            win.geometry('+%d+%d' % (_x, _y))
+        except Exception:
+            pass
+        return win
+
+    def _fill_review_dialog(self, win, review_type, report):
+        """评级完成后填充结果到已弹出的窗口"""
+        try:
+            if win is None or not win.winfo_exists():
+                # 窗口已关闭（用户可能取消了）→ 用原逻辑重建
+                self._show_review_dialog(review_type, report)
+                return
+            self.label_gen_time.config(text='评级完成')
+            self.btn_generate.config(state=tk.NORMAL)
+            _name = '剧本' if review_type == 'script' else '分镜（全局规划+分镜资产）'
+            _grade = ''
+            if report:
+                import re as _re3
+                _m = _re3.search(r'[（(]?\s*[**]?\s*评分\s*[：:]\s*[\[（(]?\s*([ABCD])\s*[\]）)]?', report)
+                if not _m:
+                    _m = _re3.search(r'\*\*评分\*\*\s*[：:]\s*([ABCD])', report)
+                if _m:
+                    _grade = _m.group(1)
+            _grade_txt = _grade if _grade else '?'
+            _color = {'A': '#27AE60', 'B': '#2E86C1', 'C': '#E67E22', 'D': '#E74C3C'}.get(_grade, '#7F8C8D')
+            # 更新标题
+            win.title('评级：%s' % _name)
+            # 填充报告文本
+            _txt = getattr(win, '_review_txt', None)
+            if _txt is not None:
+                _txt.config(state=tk.NORMAL)
+                _txt.delete('1.0', tk.END)
+                _txt.insert(tk.END, report if report else '（评级失败：无法获取评级报告，请检查 API 配置或网络）')
+                _txt.config(state=tk.DISABLED)
+            # 评分显示（重新构建顶部区：先清 loading，再加评分+按钮）
+            for _w in win.winfo_children():
+                try:
+                    _w.destroy()
+                except Exception:
+                    pass
+            head = tk.Frame(win, bg='#FFFFFF')
+            head.pack(fill='x', padx=16, pady=(14, 4))
+            tk.Label(head, text='评级报告 · %s' % _name, font=('微软雅黑', 13, 'bold'),
+                     bg='#FFFFFF', fg='#2C3E50').pack(anchor='w')
+            grade_row = tk.Frame(win, bg='#FFFFFF')
+            grade_row.pack(fill='x', padx=16, pady=4)
+            tk.Label(grade_row, text='综合评分：', font=('微软雅黑', 11), bg='#FFFFFF',
+                     fg='#34495E').pack(side='left')
+            tk.Label(grade_row, text=_grade_txt, font=('微软雅黑', 24, 'bold'),
+                     bg='#FFFFFF', fg=_color).pack(side='left', padx=(8, 0))
+            _grade_desc = {'A': '可直接使用', 'B': '小修后可用', 'C': '需较大修改', 'D': '建议重做'}.get(_grade, '')
+            if _grade_desc:
+                tk.Label(grade_row, text=_grade_desc, font=('微软雅黑', 11),
+                         bg='#FFFFFF', fg=_color).pack(side='left', padx=(10, 0))
+            txt = scrolledtext.ScrolledText(win, font=('微软雅黑', 10), wrap='word',
+                                            bg='#FBFCFC', fg='#2C3E50', relief='solid', bd=1)
+            txt.pack(fill='both', expand=True, padx=16, pady=(10, 4))
+            txt.insert(tk.END, report if report else '（评级失败：无法获取评级报告，请检查 API 配置或网络）')
+            txt.config(state=tk.DISABLED)
+            # ===== 2026-08-21 用户指令输入区（输入修改诉求 → 上传给程序）=====
+            _inp_frame = tk.Frame(win, bg='#FFFFFF')
+            _inp_frame.pack(fill='x', padx=16, pady=(2, 6))
+            tk.Label(_inp_frame, text='📝 你的指令/修改诉求：', font=('微软雅黑', 10, 'bold'),
+                     bg='#FFFFFF', fg='#2C3E50').pack(anchor='w')
+            _inp_hint = tk.Label(_inp_frame, text='（例：台词太书面，改成口语；节奏太慢加快；直接通过）',
+                                 font=('微软雅黑', 8), bg='#FFFFFF', fg='#95A5A6')
+            _inp_hint.pack(anchor='w')
+            _entry = tk.Text(_inp_frame, font=('微软雅黑', 10), height=2, wrap='word',
+                             bg='#FEFEFE', fg='#2C3E50', relief='solid', bd=1)
+            _entry.pack(fill='x', pady=(4, 6))
+            win._review_entry = _entry
+            btns = tk.Frame(win, bg='#FFFFFF')
+            btns.pack(fill='x', padx=16, pady=(0, 14))
+            _regen_txt = ('🔄 重新生成' + ('（当前评级建议重做）' if _grade == 'D' else ''))
+            b_regen = tk.Button(btns, text=_regen_txt, font=('微软雅黑', 11),
+                                bg='#E74C3C', fg='white', relief='flat', padx=18, pady=6,
+                                command=lambda: self._on_review_regen(review_type, report, win))
+            b_regen.pack(side='right', padx=(10, 0))
+            # 2026-08-21 上传指令按钮：把用户输入框内容作为修改指令 → 重新生成
+            b_send = tk.Button(btns, text='📤 上传指令', font=('微软雅黑', 11),
+                               bg='#F39C12', fg='white', relief='flat', padx=18, pady=6,
+                               command=lambda: self._on_review_send(review_type, report, win))
+            b_send.pack(side='right', padx=(10, 0))
+            b_pass = tk.Button(btns, text='✅ 确认通过，继续下一步', font=('微软雅黑', 11),
+                               bg='#27AE60', fg='white', relief='flat', padx=18, pady=6,
+                               command=lambda: self._on_review_pass(review_type, win))
+            b_pass.pack(side='right')
+            # 窗口加高，确保按钮和输入框可见
+            try:
+                win.geometry('720x680')
+                _x = self.root.winfo_x() + max(0, (self.root.winfo_width() - 720) // 2)
+                _y = self.root.winfo_y() + max(0, (self.root.winfo_height() - 680) // 2)
+                win.geometry('+%d+%d' % (_x, _y))
+            except Exception:
+                pass
+            win.update_idletasks()
+        except Exception as e:
+            self.ctx.log('\n[系统日志] 评级结果填充异常: %s\n' % e)
+            try:
+                self._show_review_dialog(review_type, report)
+            except Exception:
+                pass
+
+    def _show_review_dialog(self, review_type, report):
+        """评级结果弹窗：评分 + 问题清单 + 通过/重新生成"""
+        self.label_gen_time.config(text='评级完成')
+        self.btn_generate.config(state=tk.NORMAL)
+        _name = '剧本' if review_type == 'script' else '分镜（全局规划+分镜资产）'
+        _grade = ''
+        if report:
+            import re as _re3
+            # 宽松匹配：评分：A / **评分**：B / 评分: C / 评分 [D] / （评分：A） 等
+            _m = _re3.search(r'[（(]?\s*[**]?\s*评分\s*[：:]\s*[\[（(]?\s*([ABCD])\s*[\]）)]?', report)
+            if not _m:
+                _m = _re3.search(r'\*\*评分\*\*\s*[：:]\s*([ABCD])', report)
+            if _m:
+                _grade = _m.group(1)
+        _grade_txt = _grade if _grade else '?'
+        _color = {'A': '#27AE60', 'B': '#2E86C1', 'C': '#E67E22', 'D': '#E74C3C'}.get(_grade, '#7F8C8D')
+
+        win = tk.Toplevel(self.root)
+        win.title('评级：%s' % _name)
+        win.configure(bg='#FFFFFF')
+        win.geometry('720x560')
+        win.transient(self.root)
+        win.grab_set()
+        # 顶部：评分大字
+        head = tk.Frame(win, bg='#FFFFFF')
+        head.pack(fill='x', padx=16, pady=(14, 4))
+        tk.Label(head, text='评级报告 · %s' % _name, font=('微软雅黑', 13, 'bold'),
+                 bg='#FFFFFF', fg='#2C3E50').pack(anchor='w')
+        grade_row = tk.Frame(win, bg='#FFFFFF')
+        grade_row.pack(fill='x', padx=16, pady=4)
+        tk.Label(grade_row, text='综合评分：', font=('微软雅黑', 11), bg='#FFFFFF',
+                 fg='#34495E').pack(side='left')
+        tk.Label(grade_row, text=_grade_txt, font=('微软雅黑', 24, 'bold'),
+                 bg='#FFFFFF', fg=_color).pack(side='left', padx=(8, 0))
+        _grade_desc = {'A': '可直接使用', 'B': '小修后可用', 'C': '需较大修改', 'D': '建议重做'}.get(_grade, '')
+        if _grade_desc:
+            tk.Label(grade_row, text=_grade_desc, font=('微软雅黑', 11),
+                     bg='#FFFFFF', fg=_color).pack(side='left', padx=(10, 0))
+        # 报告文本
+        txt = scrolledtext.ScrolledText(win, font=('微软雅黑', 10), wrap='word',
+                                        bg='#FBFCFC', fg='#2C3E50', relief='solid', bd=1)
+        txt.pack(fill='both', expand=True, padx=16, pady=(10, 4))
+        txt.insert(tk.END, report if report else '（评级失败：无法获取评级报告，请检查 API 配置或网络）')
+        txt.config(state=tk.DISABLED)
+        # ===== 2026-08-21 用户指令输入区（输入修改诉求 → 上传给程序）=====
+        _inp_frame = tk.Frame(win, bg='#FFFFFF')
+        _inp_frame.pack(fill='x', padx=16, pady=(2, 6))
+        tk.Label(_inp_frame, text='📝 你的指令/修改诉求：', font=('微软雅黑', 10, 'bold'),
+                 bg='#FFFFFF', fg='#2C3E50').pack(anchor='w')
+        _inp_hint = tk.Label(_inp_frame, text='（例：台词太书面，改成口语；节奏太慢加快；直接通过）',
+                             font=('微软雅黑', 8), bg='#FFFFFF', fg='#95A5A6')
+        _inp_hint.pack(anchor='w')
+        _entry = tk.Text(_inp_frame, font=('微软雅黑', 10), height=2, wrap='word',
+                         bg='#FEFEFE', fg='#2C3E50', relief='solid', bd=1)
+        _entry.pack(fill='x', pady=(4, 6))
+        # 2026-08-21 预填主界面"附加指令"输入框的内容（用户在主界面写的诉求自动带过来）
+        try:
+            _main_cmd = self.text_input_command.get('1.0', tk.END).strip()
+            if _main_cmd:
+                _entry.insert('1.0', _main_cmd)
+        except Exception:
+            pass
+        win._review_entry = _entry
+        # 按钮
+        btns = tk.Frame(win, bg='#FFFFFF')
+        btns.pack(fill='x', padx=16, pady=(0, 14))
+        _regen_txt = ('🔄 重新生成' + ('（当前评级建议重做）' if _grade == 'D' else ''))
+        b_regen = tk.Button(btns, text=_regen_txt, font=('微软雅黑', 11),
+                            bg='#E74C3C', fg='white', relief='flat', padx=18, pady=6,
+                            command=lambda: self._on_review_regen(review_type, report, win))
+        b_regen.pack(side='right', padx=(10, 0))
+        # 2026-08-21 上传指令按钮：把用户输入框内容作为修改指令 → 重新生成
+        b_send = tk.Button(btns, text='📤 上传指令', font=('微软雅黑', 11),
+                           bg='#F39C12', fg='white', relief='flat', padx=18, pady=6,
+                           command=lambda: self._on_review_send(review_type, report, win))
+        b_send.pack(side='right', padx=(10, 0))
+        b_pass = tk.Button(btns, text='✅ 确认通过，继续下一步', font=('微软雅黑', 11),
+                           bg='#27AE60', fg='white', relief='flat', padx=18, pady=6,
+                           command=lambda: self._on_review_pass(review_type, win))
+        b_pass.pack(side='right')
+        win.update_idletasks()
+        # 窗口加高 + 居中（确保按钮和输入框可见）
+        try:
+            win.geometry('720x680')
+            _x = self.root.winfo_x() + max(0, (self.root.winfo_width() - 720) // 2)
+            _y = self.root.winfo_y() + max(0, (self.root.winfo_height() - 680) // 2)
+            win.geometry('+%d+%d' % (_x, _y))
+        except Exception:
+            pass
+
+    def _on_review_pass(self, review_type, win):
+        """用户确认通过 → 进入下一阶段"""
+        try:
+            win.destroy()
+        except Exception:
+            pass
+        # 2026-08-21 防重复：取消所有挂起的阶段回调，标记当前阶段已确认
+        try:
+            if getattr(self, '_pending_stage_after', None) is not None:
+                self.root.after_cancel(self._pending_stage_after)
+                self._pending_stage_after = None
+        except Exception:
+            pass
+        if review_type == 'script':
+            # 阶段①通过 → 阶段②（资产清单）
+            self._stage_review_done.add('[STAGE1_DONE]')
+            self._gen_review_text = ''
+            self._run_stage2()
+        elif review_type == 'storyboard':
+            # 阶段②通过 → 阶段③（剪辑方案）
+            self._stage_review_done.add('[STAGE2_DONE]')
+            self._gen_review_text = ''
+            self._run_stage3()
+
+    def _on_review_regen(self, review_type, report, win):
+        """用户选择重新生成 → 携带评级意见重跑当前阶段"""
+        try:
+            win.destroy()
+        except Exception:
+            pass
+        # 携带评级报告作为重生成指令
+        self._gen_review_text = report or ''
+        if review_type == 'script':
+            self._run_stage1(regen=True)
+        elif review_type == 'storyboard':
+            # 2026-08-21 分镜评级不通过 → 重跑分镜段（②B），资产保留不重跑
+            self._run_stage2b(regen=True)
+
+    def _on_review_send(self, review_type, report, win):
+        """2026-08-21 上传指令：读取评级窗输入框内容作为用户修改诉求 → 连同评级意见一起重新生成"""
+        _user_cmd = ''
+        try:
+            _entry = getattr(win, '_review_entry', None)
+            if _entry is not None:
+                _user_cmd = _entry.get('1.0', tk.END).strip()
+        except Exception:
+            _user_cmd = ''
+        if not _user_cmd:
+            self._show_toast('请先在输入框填写你的修改指令（如：台词再口语化 / 节奏加快 / 直接通过）', 'warning')
+            return
+        try:
+            win.destroy()
+        except Exception:
+            pass
+        # 用户指令 + 评级意见 一起作为重生成指令
+        _combined = ''
+        if report:
+            _combined = ('【你的修改要求】\n' + _user_cmd +
+                         '\n\n【AI 评级意见（供参考）】\n' + report[:3000])
+        else:
+            _combined = '【你的修改要求】\n' + _user_cmd
+        self._gen_review_text = _combined
+        self.ctx.log('\n[系统日志] 已收到你的指令：%s\n' % _user_cmd[:100])
+        if review_type == 'script':
+            self._run_stage1(regen=True)
+        elif review_type == 'storyboard':
+            # 2026-08-21 分镜指令重生成 → 重跑分镜段（②B），资产保留
+            self._run_stage2b(regen=True)
+
+    def _run_stage1(self, regen=False):
+        """阶段①：剧本生成（A基础角色+B剧本正文）→ [STAGE1_DONE]"""
+        try:
+            self.ctx.stop_flag = False
+            self.btn_generate.config(state=tk.DISABLED)
+            self.btn_stop.config(state=tk.NORMAL)
+            self.progress_bar.start()
+            self._gen_stage = 1
+            # 2026-08-21 重新生成时清空对应阶段 tab（避免内容追加到旧文本后）
+            if regen:
+                # 允许重新评级
+                try:
+                    self._stage_review_done.discard('[STAGE1_DONE]')
+                except Exception:
+                    pass
+                for _k in ('all', 'script'):
+                    try:
+                        _w = self.text_widgets.get(_k)
+                        if _w is not None:
+                            _w.config(state=tk.NORMAL)
+                            _w.delete('1.0', tk.END)
+                            _w.config(state=tk.DISABLED)
+                    except Exception:
+                        pass
+            _extra = ''
+            if regen and self._gen_review_text:
+                _extra = ('上一版剧本评级未通过，请根据以下评级意见针对性修改后重新输出完整剧本：\n'
+                          + self._gen_review_text[:4000] +
+                          '\n\n注意：只输出【剧本信息】【A. 剧本基础角色资产】【B. 剧本正文】，'
+                          '输出完毕后输出 [STAGE1_DONE]')
+            self.agent.generate_storyboard(self._gen_novel_text,
+                                           self._gen_command_text,
+                                           self._get_api_config(), self._gen_system_prompt,
+                                           stop_marker='[STAGE1_DONE]',
+                                           extra_context=_extra)
+        except Exception as e:
+            self.ctx.log('\n[系统日志] 阶段①生成启动异常: %s\n' % e)
+
+    def _run_stage2(self, regen=False):
+        """阶段②A：全资产(C/D/E) 生成 → [ASSETS_DONE]，等用户确认资产清单后再出分镜"""
+        try:
+            self.ctx.stop_flag = False
+            self.btn_generate.config(state=tk.DISABLED)
+            self.btn_stop.config(state=tk.NORMAL)
+            self.progress_bar.start()
+            self._gen_stage = 2
+            # 2026-08-21 重新生成时清空对应阶段 tab（资产；保留剧本 script/all 不清）
+            if regen:
+                # 允许重新确认资产
+                try:
+                    self._stage_review_done.discard('[ASSETS_DONE]')
+                except Exception:
+                    pass
+                for _k in ('character', 'scene', 'prop'):
+                    try:
+                        _w = self.text_widgets.get(_k)
+                        if _w is not None:
+                            _w.config(state=tk.NORMAL)
+                            _w.delete('1.0', tk.END)
+                            _w.config(state=tk.DISABLED)
+                    except Exception:
+                        pass
+            # 2026-08-21 资产提取唯一来源：显式注入本集剧本正文（LLM 上下文只有小说全文时
+            # 会从全文提取资产 → 资产比剧本用到的多。剧本正文必须作为唯一提取依据发给 LLM）
+            _script_text = ''
+            try:
+                _w = self.text_widgets.get('script')
+                if _w is not None:
+                    _script_text = _w.get('1.0', tk.END).strip()
+                if not _script_text:
+                    _script_text = str((self.current_project or {}).get('sections', {}).get('script') or '').strip()
+            except Exception:
+                _script_text = ''
+            _extra = ('剧本已通过评级确认。现在开始第二阶段A（资产清单）：'
+                      '输出【C. 角色资产】【D. 场景资产】【E. 道具资产】（完整资产卡，'
+                      '每张卡含中文+英文AI提示词）。'
+                      '输出完毕后输出 [ASSETS_DONE] 并立即停止，等软件确认资产清单。')
+            if _script_text:
+                _extra += ('\n\n【本集剧本正文 · 资产提取唯一依据】\n'
+                           '以下是本集【B. 剧本正文】全文。C/D/E 资产（角色/场景/道具）'
+                           '只能从这份剧本正文中逐字提取：正文中出现的角色、场景、道具才生成资产卡，'
+                           '正文未出现的严禁生成。用户消息中的小说全文仅供理解世界观背景，'
+                           '严禁从小说全文或后续章节中提取任何资产。\n'
+                           '----------\n' + _script_text + '\n----------')
+            if regen and self._gen_review_text:
+                _extra += ('\n\n上一版资产清单需调整，请根据以下要求修改后重新输出完整资产卡：\n'
+                           + self._gen_review_text[:4000])
+            self.agent.generate_storyboard(self._gen_novel_text,
+                                           self._gen_command_text,
+                                           self._get_api_config(), self._gen_system_prompt,
+                                           stop_marker='[ASSETS_DONE]',
+                                           extra_context=_extra)
+        except Exception as e:
+            self.ctx.log('\n[系统日志] 阶段②A 资产生成启动异常: %s\n' % e)
+
+    def _run_stage2b(self, regen=False):
+        """阶段②B：分镜全局规划 + F段分镜资产 → [STAGE2_DONE]，之后评级"""
+        try:
+            self.ctx.stop_flag = False
+            self.btn_generate.config(state=tk.DISABLED)
+            self.btn_stop.config(state=tk.NORMAL)
+            self.progress_bar.start()
+            self._gen_stage = 2
+            # 2026-08-21 重新生成时清空分镜 tab（资产保留）
+            if regen:
+                # 允许重新评级分镜
+                try:
+                    self._stage_review_done.discard('[STAGE2_DONE]')
+                except Exception:
+                    pass
+                for _k in ('global_plan', 'storyboard'):
+                    try:
+                        _w = self.text_widgets.get(_k)
+                        if _w is not None:
+                            _w.config(state=tk.NORMAL)
+                            _w.delete('1.0', tk.END)
+                            _w.config(state=tk.DISABLED)
+                    except Exception:
+                        pass
+            # 2026-08-21 分镜阶段同样显式注入本集剧本正文（分镜必须基于本集剧本，防 LLM 依赖全文）
+            _script_text = ''
+            try:
+                _w = self.text_widgets.get('script')
+                if _w is not None:
+                    _script_text = _w.get('1.0', tk.END).strip()
+                if not _script_text:
+                    _script_text = str((self.current_project or {}).get('sections', {}).get('script') or '').strip()
+            except Exception:
+                _script_text = ''
+            _extra = ('资产清单已通过用户确认。现在开始第二阶段B（分镜）：'
+                      '先输出【阶段一：分镜脚本（全局规划）】，再输出【F. 分镜资产】（按时长切分）。'
+                      '输出完毕后输出 [STAGE2_DONE]')
+            if _script_text:
+                _extra += ('\n\n【本集剧本正文 · 分镜依据】\n'
+                           '以下是本集【B. 剧本正文】全文。分镜全局规划与 F 段分镜资产'
+                           '必须严格基于这份剧本正文：只规划本集正文包含的剧情、角色、场景、道具与台词，'
+                           '严禁从小说全文或后续章节取景、取角色、取剧情。\n'
+                           '----------\n' + _script_text + '\n----------')
+            if regen and self._gen_review_text:
+                _extra += ('\n\n上一版分镜评级未通过，请根据以下评级意见针对性修改后重新输出完整内容：\n'
+                           + self._gen_review_text[:4000])
+            self.agent.generate_storyboard(self._gen_novel_text,
+                                           self._gen_command_text,
+                                           self._get_api_config(), self._gen_system_prompt,
+                                           stop_marker='[STAGE2_DONE]',
+                                           extra_context=_extra)
+        except Exception as e:
+            self.ctx.log('\n[系统日志] 阶段②B 分镜生成启动异常: %s\n' % e)
+
+    def _on_assets_complete(self):
+        """2026-08-21 资产段完成：对比 剧本涉及资产 vs 实际生成资产，弹确认框"""
+        try:
+            # 2026-08-21 防重复：清空挂起回调，标记资产段已处理
+            try:
+                if getattr(self, '_pending_stage_after', None) is not None:
+                    self.root.after_cancel(self._pending_stage_after)
+                    self._pending_stage_after = None
+            except Exception:
+                pass
+            try:
+                self._stage_review_done.add('[ASSETS_DONE]')
+            except Exception:
+                pass
+            self.progress_bar.stop()
+            self.btn_stop.config(state=tk.DISABLED)
+            self.label_gen_time.config(text='资产清单已生成，等待确认')
+            self.ctx.log('\n[系统日志] 资产清单已生成，等待用户确认...\n')
+            self._show_assets_confirm_dialog()
+        except Exception as e:
+            self.ctx.log('\n[系统日志] 资产确认处理异常: %s\n' % e)
+            try:
+                self._show_assets_confirm_dialog()
+            except Exception:
+                pass
+
+    def _collect_script_assets(self):
+        """从剧本正文（script tab）提取涉及的资产名：角色（△ 台词说话人）/场景（○ 标记）/道具（正文实体词）"""
+        import re as _re
+        _script = ''
+        try:
+            _script = self.text_widgets.get('script').get('1.0', tk.END) or ''
+        except Exception:
+            pass
+        chars, scenes, props = [], [], []
+        try:
+            for line in _script.split('\n'):
+                _l = line.strip()
+                # 场景：○ 内景/外景 - 场景名 - 日/夜
+                _m = _re.match(r'^[○O]\s*(内景|外景|内|外)\s*[-－]\s*(.+?)\s*[-－]', _l)
+                if _m:
+                    _sn = _m.group(2).strip()
+                    if _sn and _sn not in scenes:
+                        scenes.append(_sn)
+                    continue
+                # 角色：△ 说话人（...）：或 △ 说话人：
+                _m2 = _re.match(r'^[△▲]\s*([^（(：:]{1,12})', _l)
+                if _m2:
+                    _cn = _m2.group(1).strip()
+                    if _cn and _cn not in chars:
+                        chars.append(_cn)
+        except Exception:
+            pass
+        return {'characters': chars, 'scenes': scenes, 'props': props}
+
+    def _collect_generated_assets(self):
+        """从 C/D/E 资产 tab 提取实际生成的资产卡列表"""
+        assets = []
+        try:
+            for _k, _t in (('character', '角色'), ('scene', '场景'), ('prop', '道具')):
+                _txt = ''
+                try:
+                    _txt = self.text_widgets.get(_k).get('1.0', tk.END) or ''
+                except Exception:
+                    pass
+                _parsed = self._extract_assets_full(_txt)
+                for _a in _parsed:
+                    assets.append({'type': _a['type'], 'name': _a['name'], 'prompt_en': _a.get('prompt_en', '')})
+        except Exception:
+            pass
+        return assets
+
+    def _show_assets_confirm_dialog(self):
+        """2026-08-21 资产确认对话框：剧本涉及的资产 vs 实际生成的资产卡"""
+        import re as _re
+        _script_assets = self._collect_script_assets()
+        _generated = self._collect_generated_assets()
+        _gen_names = set()
+        for _a in _generated:
+            _gen_names.add(_a['name'].strip())
+        # 2026-08-21 道具对比：剧本正文 vs 生成的道具卡。
+        # 剧本正文没有道具专属标记（不像 ○场景/△角色），用"生成道具卡名反查剧本"判定：
+        # 道具名（或其中任意连续3字）出现在剧本正文 = 剧本涉及的道具；否则 = 可能多余。
+        _script_text = ''
+        try:
+            _script_text = self.text_widgets.get('script').get('1.0', tk.END) or ''
+        except Exception:
+            _script_text = ''
+
+        def _prop_in_script(_pn, _txt):
+            if not _pn:
+                return False
+            if _pn in _txt:
+                return True
+            if len(_pn) >= 3:
+                for _i in range(len(_pn) - 2):
+                    if _pn[_i:_i + 3] in _txt:
+                        return True
+            return False
+
+        _props_in_script = []
+        _props_not_in_script = []
+        for _a in _generated:
+            if _a['type'] == 'prop':
+                _pn = _a['name'].strip()
+                if _prop_in_script(_pn, _script_text):
+                    _props_in_script.append(_pn)
+                else:
+                    _props_not_in_script.append(_pn)
+        # 剧本涉及 vs 生成 对比（字符匹配：剧本角色名是否在生成的角色卡里）
+        _missing = []
+        for _cn in _script_assets.get('characters', []):
+            if _cn and not any(_cn in _g or _g in _cn for _g in _gen_names):
+                _missing.append(('角色', _cn))
+        for _sn in _script_assets.get('scenes', []):
+            if _sn and not any(_sn in _g or _g in _sn for _g in _gen_names):
+                _missing.append(('场景', _sn))
+
+        win = tk.Toplevel(self.root)
+        win.title('资产清单确认')
+        win.configure(bg='#FFFFFF')
+        win.geometry('860x640')
+        win.transient(self.root)
+        win.grab_set()
+        # 标题
+        tk.Label(win, text='📋 资产清单确认', font=('微软雅黑', 14, 'bold'),
+                 bg='#FFFFFF', fg='#2C3E50').pack(anchor='w', padx=16, pady=(12, 4))
+        tk.Label(win, text='请确认剧本中涉及的资产是否都已生成：',
+                 font=('微软雅黑', 10), bg='#FFFFFF', fg='#7F8C8D').pack(anchor='w', padx=16)
+        # 内容区（左右两栏对比）
+        body = tk.Frame(win, bg='#FFFFFF')
+        body.pack(fill='both', expand=True, padx=16, pady=8)
+        body.grid_columnconfigure(0, weight=1)
+        body.grid_columnconfigure(1, weight=1)
+        # 左：剧本涉及
+        left = tk.Frame(body, bg='#F8F9F9', relief='solid', bd=1)
+        left.grid(row=0, column=0, sticky='nsew', padx=(0, 6))
+        tk.Label(left, text='🎬 剧本涉及的资产', font=('微软雅黑', 11, 'bold'),
+                 bg='#F8F9F9', fg='#2C3E50').pack(anchor='w', padx=8, pady=6)
+        _lt = scrolledtext.ScrolledText(left, font=('微软雅黑', 9), wrap='word', height=14,
+                                        bg='#FFFFFF', fg='#2C3E50', relief='flat')
+        _lt.pack(fill='both', expand=True, padx=6, pady=(0, 6))
+        _lt_txt = '【角色】\n' + ('\n'.join(_script_assets.get('characters', [])) or '（未识别到）')
+        _lt_txt += '\n\n【场景】\n' + ('\n'.join(_script_assets.get('scenes', [])) or '（未识别到）')
+        # 2026-08-21 道具段：剧本涉及的道具（生成道具卡中剧本正文出现的）
+        _lt_txt += '\n\n【道具（剧本涉及）】\n' + ('\n'.join(_props_in_script) or '（未识别到）')
+        _lt.insert('1.0', _lt_txt)
+        _lt.config(state=tk.DISABLED)
+        # 右：实际生成
+        right = tk.Frame(body, bg='#F8F9F9', relief='solid', bd=1)
+        right.grid(row=0, column=1, sticky='nsew', padx=(6, 0))
+        tk.Label(right, text='🖼 实际生成的资产卡', font=('微软雅黑', 11, 'bold'),
+                 bg='#F8F9F9', fg='#2C3E50').pack(anchor='w', padx=8, pady=6)
+        _rt = scrolledtext.ScrolledText(right, font=('微软雅黑', 9), wrap='word', height=14,
+                                        bg='#FFFFFF', fg='#2C3E50', relief='flat')
+        _rt.pack(fill='both', expand=True, padx=6, pady=(0, 6))
+        _rt_txt = ''
+        for _a in _generated:
+            _rt_txt += '[%s] %s\n' % ({'character': '角色', 'scene': '场景', 'prop': '道具'}.get(_a['type'], _a['type']), _a['name'])
+        _rt.insert('1.0', _rt_txt or '（未生成任何资产卡）')
+        _rt.config(state=tk.DISABLED)
+        # 缺失提示
+        if _missing:
+            _miss_txt = '⚠️ 剧本中出现但可能未生成：\n' + '\n'.join('[%s] %s' % (t, n) for t, n in _missing)
+            _miss_lbl = tk.Label(win, text=_miss_txt, font=('微软雅黑', 9, 'bold'),
+                                 bg='#FDEDEC', fg='#C0392B', anchor='w', justify='left')
+            _miss_lbl.pack(fill='x', padx=16, pady=(0, 6))
+        else:
+            tk.Label(win, text='✅ 剧本涉及的资产均已生成', font=('微软雅黑', 10, 'bold'),
+                     bg='#EAF7EA', fg='#27AE60').pack(fill='x', padx=16, pady=(0, 6))
+        # 2026-08-21 多余道具提示：生成但剧本正文未出现的道具（可能从小说全文/旧版本生成）
+        if _props_not_in_script:
+            _extra_txt = ('⚠️ 生成但剧本正文未涉及的道具（可能多余，请确认）：\n'
+                          + '、'.join(_props_not_in_script[:30])
+                          + ('…' if len(_props_not_in_script) > 30 else ''))
+            tk.Label(win, text=_extra_txt, font=('微软雅黑', 9, 'bold'),
+                     bg='#FEF9E7', fg='#B7950B', anchor='w', justify='left',
+                     wraplength=820).pack(fill='x', padx=16, pady=(0, 6))
+        # 输入框（补充指令）
+        _inp_frame = tk.Frame(win, bg='#FFFFFF')
+        _inp_frame.pack(fill='x', padx=16, pady=(2, 6))
+        tk.Label(_inp_frame, text='📝 补充/修改资产指令（可选）：', font=('微软雅黑', 10, 'bold'),
+                 bg='#FFFFFF', fg='#2C3E50').pack(anchor='w')
+        _entry = tk.Text(_inp_frame, font=('微软雅黑', 10), height=2, wrap='word',
+                         bg='#FEFEFE', fg='#2C3E50', relief='solid', bd=1)
+        _entry.pack(fill='x', pady=(4, 6))
+        win._assets_entry = _entry
+        # 按钮
+        btns = tk.Frame(win, bg='#FFFFFF')
+        btns.pack(fill='x', padx=16, pady=(0, 12))
+        b_supp = tk.Button(btns, text='🔄 重新生成资产（按指令）', font=('微软雅黑', 11),
+                           bg='#E67E22', fg='white', relief='flat', padx=14, pady=6,
+                           command=lambda: self._on_assets_supplement(win))
+        b_supp.pack(side='right', padx=(8, 0))
+        b_ok = tk.Button(btns, text='✅ 确认无误，继续生成分镜', font=('微软雅黑', 11),
+                         bg='#27AE60', fg='white', relief='flat', padx=18, pady=6,
+                         command=lambda: self._on_assets_confirm(win))
+        b_ok.pack(side='right')
+        win.update_idletasks()
+        # 窗口居中
+        try:
+            _x = self.root.winfo_x() + max(0, (self.root.winfo_width() - 860) // 2)
+            _y = self.root.winfo_y() + max(0, (self.root.winfo_height() - 640) // 2)
+            win.geometry('+%d+%d' % (_x, _y))
+        except Exception:
+            pass
+
+    def _on_assets_confirm(self, win):
+        """2026-08-21 资产确认通过 → 继续分镜生成（阶段②B）"""
+        try:
+            win.destroy()
+        except Exception:
+            pass
+        self.ctx.log('\n[系统日志] 资产清单已确认，开始生成分镜...\n')
+        self._gen_review_text = ''
+        self._run_stage2b()
+
+    def _on_assets_supplement(self, win):
+        """2026-08-21 补充资产指令 → 重跑资产段（携带用户指令）"""
+        _user_cmd = ''
+        try:
+            _entry = getattr(win, '_assets_entry', None)
+            if _entry is not None:
+                _user_cmd = _entry.get('1.0', tk.END).strip()
+        except Exception:
+            _user_cmd = ''
+        try:
+            win.destroy()
+        except Exception:
+            pass
+        if _user_cmd:
+            self._gen_review_text = '【你的资产补充/修改要求】\n' + _user_cmd[:2000]
+            self.ctx.log('\n[系统日志] 资产补充指令：%s\n' % _user_cmd[:100])
+        else:
+            self._gen_review_text = '请重新生成资产清单，确保剧本中所有角色、场景、道具都有对应资产卡。'
+        self._run_stage2(regen=True)
+
+    def _run_stage3(self):
+        """阶段③：剪映剪辑指导方案(G) → [ALL_DONE] 全部完成"""
+        try:
+            self.ctx.stop_flag = False
+            self.btn_generate.config(state=tk.DISABLED)
+            self.btn_stop.config(state=tk.NORMAL)
+            self.progress_bar.start()
+            self._gen_stage = 3
+            _extra = ('分镜已通过评级确认。现在开始第三阶段（最后一段）：'
+                      '输出【剪映专业剪辑指导方案】（G段），输出完毕后输出 [ALL_DONE]')
+            self.agent.generate_storyboard(self._gen_novel_text,
+                                           self._gen_command_text,
+                                           self._get_api_config(), self._gen_system_prompt,
+                                           stop_marker='[ALL_DONE]',
+                                           extra_context=_extra)
+        except Exception as e:
+            self.ctx.log('\n[系统日志] 阶段③生成启动异常: %s\n' % e)
+
+    def _advance_episode(self):
+        """2026-08-21 续写功能：全集链路完成（第三段 [ALL_DONE]）后推进集数记录并保存。
+
+        正常生成（非续写）→ episode 至少记为 1；续写模式 → 记为本次目标集数。
+        下次勾选「续写下一集」时据此自动生成下一集。
+        """
+        try:
+            if not self.current_project:
+                return
+            _ep = int(self.current_project.get('episode', 0) or 0)
+            _target = getattr(self, '_continue_episode_target', 0) or 1
+            if _target > _ep:
+                self.current_project['episode'] = _target
+                try:
+                    self._auto_save_project()
+                except Exception:
+                    pass
+                self.ctx.log('[系统日志] ✅ 第 %d 集全链路完成，集数记录已推进（下次勾选「续写下一集」将自动生成第 %d 集）\n'
+                             % (_target, _target + 1))
+        except Exception as e:
+            self.ctx.log('[系统日志] 集数推进异常: %s\n' % e)
 
     def _on_stop_click(self):
         self.ctx.stop_flag = True
@@ -6097,9 +8153,17 @@ class CineMasterUI:
         # 清空内部状态
         self.line_buffer = ''
         self.current_section = 'script'
+        # 2026-08-21 续写功能：清除资产=从头开始 → 重置集数记录
+        try:
+            if self.current_project:
+                self.current_project['episode'] = 0
+        except Exception:
+            pass
         self.image_history = []
         self._selected_hist_idx = set()
         self.video_history = []
+        self._video_local_paths = {}
+        self._video_preview_frames = {}
         self.current_image_url = ''
         self.current_video_url = ''
         self.video_ref_image_urls = []
@@ -6457,7 +8521,77 @@ class CineMasterUI:
 
     def _upload_history_image(self):
         """2026-08-15 需求1：上传本地图片到图片历史记录（支持多选）。
-        选图 → 若媒体供应商是 ComfyUI 则上传拿 url（供视频参考图链路使用）→ 加入 image_history → 刷新 UI。"""
+        2026-08-21 需求1升级：弹对话框选择「替代现有资产图」或「新增资产图」——
+        - 替代：选一个现有资产（角色/场景/道具）→ 上传后替换该资产图（image_history + asset_images）
+        - 新增：直接加进 image_history（现状）
+        选图 → 若媒体供应商是 ComfyUI 则上传拿 url（供视频参考图链路使用）→ 加入/替换 → 刷新 UI。"""
+        # 先选模式：替代 or 新增
+        dlg = tk.Toplevel(self.root)
+        dlg.title('上传图片 - 选择模式')
+        dlg.configure(bg=COLOR_PANEL)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.geometry('460x320+%d+%d' % (self.root.winfo_x() + 100, self.root.winfo_y() + 100))
+        try:
+            dlg.iconbitmap(resource_path('app.ico'))
+        except Exception:
+            pass
+        tk.Label(dlg, text='📤 上传图片：想怎么用？', font=('微软雅黑', 12, 'bold'),
+                 fg=COLOR_ACCENT_DARK, bg=COLOR_PANEL).pack(anchor='w', padx=16, pady=(14, 8))
+
+        mode_var = tk.StringVar(value='new')
+
+        # 替代模式：资产选择列表（从 image_history / asset_images 收集去重资产名）
+        tk.Radiobutton(dlg, text='🔄 替代现有资产图（如替换「林雪」的角色图）', variable=mode_var, value='replace',
+                       font=('微软雅黑', 10), bg=COLOR_PANEL, fg=COLOR_TEXT, selectcolor=COLOR_INPUT,
+                       activebackground=COLOR_PANEL).pack(anchor='w', padx=16, pady=(6, 2))
+        replace_frame = tk.Frame(dlg, bg=COLOR_PANEL)
+        replace_frame.pack(fill='both', expand=True, padx=16)
+        self._upload_replace_listbox = tk.Listbox(replace_frame, font=('微软雅黑', 9), height=5,
+                                                  relief='solid', bd=1, bg=COLOR_INPUT, fg=COLOR_TEXT,
+                                                  selectbackground=COLOR_ACCENT, activestyle='none')
+        sb = ttk.Scrollbar(replace_frame, orient='vertical', command=self._upload_replace_listbox.yview)
+        self._upload_replace_listbox.configure(yscrollcommand=sb.set)
+        self._upload_replace_listbox.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
+        # 收集资产名（去重，优先 asset_images 键，其次 image_history name）
+        _names = []
+        for _k in (self.asset_images or {}).keys():
+            if _k and _k not in _names:
+                _names.append(_k)
+        for _it in self.image_history:
+            _n = _it.get('name') or ''
+            if _n and _n not in _names:
+                _names.append(_n)
+        for _n in _names[:200]:
+            self._upload_replace_listbox.insert(tk.END, _n)
+
+        tk.Radiobutton(dlg, text='➕ 新增资产图（补充缺失的图）', variable=mode_var, value='new',
+                       font=('微软雅黑', 10), bg=COLOR_PANEL, fg=COLOR_TEXT, selectcolor=COLOR_INPUT,
+                       activebackground=COLOR_PANEL).pack(anchor='w', padx=16, pady=(6, 2))
+
+        btns = tk.Frame(dlg, bg=COLOR_PANEL)
+        btns.pack(fill='x', padx=16, pady=(8, 12))
+        def _confirm():
+            mode = mode_var.get()
+            target = ''
+            if mode == 'replace':
+                sel = self._upload_replace_listbox.curselection()
+                if not sel:
+                    self._show_toast('请先选择要替代的资产', 'warning')
+                    return
+                target = self._upload_replace_listbox.get(sel[0])
+            dlg.destroy()
+            self._do_upload_history_image(mode, target)
+        btn_ok = tk.Button(btns, text='✅ 下一步选择图片', font=('微软雅黑', 10, 'bold'),
+                           bg=COLOR_ACCENT, fg='white', relief='flat', command=_confirm)
+        btn_ok.pack(side='left', padx=(0, 8))
+        bind_hover(btn_ok, COLOR_ACCENT, COLOR_ACCENT_DARK)
+        tk.Button(btns, text='取消', font=('微软雅黑', 10), bg=COLOR_BORDER, fg=COLOR_TEXT,
+                  relief='flat', command=dlg.destroy).pack(side='left')
+
+    def _do_upload_history_image(self, mode, target):
+        """2026-08-21 真正执行上传：mode='replace'（替代 target 资产）或 'new'（新增）"""
         paths = filedialog.askopenfilenames(title="选择要上传的本地图片（可多选）", filetypes=[
             ('图片文件', '*.png *.jpg *.jpeg *.webp *.bmp'), ('所有文件', '*.*')])
         if not paths:
@@ -6492,7 +8626,7 @@ class CineMasterUI:
                                     url = base + '/view?filename=' + name.replace(' ', '%20') + '&type=input'
                     except Exception:
                         url = ''
-                    self.root.after(0, lambda u=url, im=img, p=path: self._finish_upload_history_image(u, im, p))
+                    self.root.after(0, lambda u=url, im=img, p=path: self._finish_upload_history_image(u, im, p, mode, target))
                     added += 1
                 except Exception as e:
                     failed.append(os.path.basename(path))
@@ -6501,15 +8635,47 @@ class CineMasterUI:
         threading.Thread(target=_worker, daemon=True).start()
         self._show_toast('正在上传图片...', 'info')
 
-    def _finish_upload_history_image(self, url, img, path):
-        """主线程：上传完成的图片加入 image_history 并刷新 UI"""
+    def _finish_upload_history_image(self, url, img, path, mode='new', target=''):
+        """主线程：上传完成的图片加入 image_history 并刷新 UI（2026-08-21 支持替代模式）"""
         try:
-            self.image_history.append({'url': url, 'img': img,
-                                       'name': os.path.splitext(os.path.basename(path))[0],
-                                       'prompt': '', 'type': '', 'chapter': '上传图片',
-                                       'prompt_cn': ''})
-            if len(self.image_history) > 500:
-                self.image_history.pop(0)
+            name = os.path.splitext(os.path.basename(path))[0]
+            local_path = self._save_asset_image_local(img, target or name, '')
+            if mode == 'replace' and target:
+                # 替代模式：替换该资产的所有引用（image_history + asset_images）
+                replaced = False
+                for _it in self.image_history:
+                    if _it.get('name') == target:
+                        _it.update({'url': url, 'img': img, 'local_path': local_path})
+                        replaced = True
+                        break
+                if not replaced:
+                    self.image_history.append({'url': url, 'img': img, 'name': target,
+                                               'prompt': '', 'type': '', 'chapter': '上传图片',
+                                               'prompt_cn': '', 'local_path': local_path})
+                # 同步 asset_images（资产图匹配区）
+                if target in self.asset_images:
+                    _old = self.asset_images[target]
+                    self.asset_images[target] = {'url': url, 'img': img,
+                                                 'prompt': _old.get('prompt', ''),
+                                                 'type': _old.get('type', '')}
+                try:
+                    self._match_assets_to_storyboard()
+                except Exception:
+                    pass
+                try:
+                    self._rebuild_asset_match_area()
+                except Exception:
+                    pass
+                self._show_toast('已用上传图替代资产「%s」' % target, 'success')
+            else:
+                # 新增模式（原逻辑）
+                self.image_history.append({'url': url, 'img': img,
+                                           'name': name,
+                                           'prompt': '', 'type': '', 'chapter': '上传图片',
+                                           'prompt_cn': '', 'local_path': local_path})
+                if len(self.image_history) > 500:
+                    self.image_history.pop(0)
+                self._show_toast('已新增资产图「%s」' % name, 'success')
             self._update_history_ui()
         except Exception:
             pass
@@ -6703,7 +8869,7 @@ class CineMasterUI:
         lb = tk.Label(dlg, image=ph, bg=COLOR_PANEL)
         lb.pack(padx=10, pady=(10, 4))
         # 提示词编辑区（显示该图片的提示词，可编辑）
-        tk.Label(dlg, text='✏️ 图片提示词（可编辑，修改后点"重新生成"按新提示词重绘）：', font=(_FONT_CN, 9),
+        tk.Label(dlg, text='✏️ 图片提示词（可编辑，修改后点"重新生成"按新提示词重绘）：', font=("微软雅黑", 9),
                  bg=COLOR_PANEL, fg=COLOR_TEXT).pack(anchor='w', padx=14, pady=(6, 2))
         text_prompt = tk.Text(dlg, font=FONT_CODE, wrap=tk.WORD, height=6, relief='solid', bd=1,
                               bg=COLOR_INPUT, fg=COLOR_TEXT, insertbackground=COLOR_TEXT)
@@ -6804,40 +8970,440 @@ class CineMasterUI:
         for w in self.frame_vid_history_inner.winfo_children():
             w.destroy()
         self.video_history_videos = []
+        # 2026-08-21 缩略图引用池（PhotoImage 必须持有引用防 GC）
+        self._vid_thumb_refs = []
         for i, url in enumerate(self.video_history):
             row = tk.Frame(self.frame_vid_history_inner, bg=COLOR_PANEL)
             row.pack(fill='x', padx=4, pady=2)
-            tk.Label(row, text='视频 ' + str(i + 1), font=FONT_MAIN, bg=COLOR_PANEL,
-                     fg=COLOR_TEXT).pack(side='left', padx=(0, 10))
-            b1 = tk.Button(row, text='播放', font=('微软雅黑', 9), bg=COLOR_ACCENT, fg='white',
-                           relief='flat', command=lambda u=url: self._play_specific_video(u))
-            b1.pack(side='left', padx=(0, 6))
-            bind_hover(b1, COLOR_ACCENT, COLOR_ACCENT_DARK)
-            b2 = tk.Button(row, text='下载', font=('微软雅黑', 9), bg=COLOR_PANEL,
-                           fg=COLOR_TEXT_DIM, relief='solid', bd=1, highlightbackground='#D0D0D0',
-                           command=lambda u=url: self._download_specific_video(u))
-            b2.pack(side='left')
+            # 2026-08-21 本地保存状态（已自动下载到本地显示 📁 标记）
+            _local = ''
+            try:
+                _local = (getattr(self, '_video_local_paths', {}) or {}).get(url, '')
+                if _local and not os.path.exists(_local):
+                    _local = ''
+            except Exception:
+                _local = ''
+            _tag = '📁 ' if _local else '⏳ '
+            # 2026-08-21 视频首帧缩略图（画面代替文字行；hover 画面自动播放预览）
+            _thumb = self._video_thumb_for(url)
+            if _thumb is not None:
+                img_lbl = tk.Label(row, image=_thumb, bg=COLOR_PANEL, cursor='hand2',
+                                   relief='solid', bd=1, highlightbackground='#D0D0D0')
+                img_lbl.pack(side='left', padx=(0, 8))
+                img_lbl.bind('<Enter>', lambda e, u=url: self._show_video_preview(u))
+                img_lbl.bind('<Leave>', lambda e: self._stop_video_preview())
+                self._vid_thumb_refs.append(_thumb)
+            # 2026-08-21 鼠标悬停"视频 N"标签 → 自动弹出预览（跑马灯播放）
+            lbl = tk.Label(row, text=_tag + '视频 ' + str(i + 1), font=FONT_MAIN, bg=COLOR_PANEL,
+                           fg=COLOR_TEXT, cursor='hand2')
+            lbl.pack(side='left', padx=(0, 10))
+            lbl.bind('<Enter>', lambda e, u=url: self._show_video_preview(u))
+            lbl.bind('<Leave>', lambda e: self._stop_video_preview())
+            # 2026-08-21 删除按钮：删除历史 + 本地文件同步删除（播放/下载按钮已移除——
+            # 下载自动完成，播放=鼠标放到画面上自动播放）
+            b3 = tk.Button(row, text='🗑 删除', font=('微软雅黑', 9), bg='#F5F5F5',
+                           fg='#C0392B', relief='solid', bd=1, highlightbackground='#E0C0C0',
+                           command=lambda u=url: self._delete_video_history_item(u))
+            b3.pack(side='left')
             self.video_history_videos.append(url)
+        # 2026-08-21 需求3：批量生成中 → 列表顶部渲染"正在生成"跑马灯进度行
+        if getattr(self, '_sb_batch_in_progress', False):
+            self._render_video_progress_marquee()
+
+    def _video_thumb_for(self, url):
+        """2026-08-21 视频首帧缩略图：预览帧目录第一张 PNG 缩放到 160x90；无帧返回 None"""
+        try:
+            _frames = (getattr(self, '_video_preview_frames', {}) or {}).get(url, '')
+            if not _frames or not os.path.isdir(_frames):
+                return None
+            _fl = sorted(f for f in os.listdir(_frames) if f.lower().endswith('.png'))
+            if not _fl:
+                return None
+            from PIL import ImageTk
+            _img = Image.open(os.path.join(_frames, _fl[0])).convert('RGB')
+            _img.thumbnail((160, 90), Image.LANCZOS)
+            return ImageTk.PhotoImage(_img)
+        except Exception:
+            return None
+
+    def _delete_video_history_item(self, url):
+        """2026-08-21 删除视频历史条目：移除历史 + 本地文件同步删除（videos/ + 尾帧）"""
+        if not url:
+            return
+        _local = ''
+        try:
+            _local = (getattr(self, '_video_local_paths', {}) or {}).get(url, '')
+        except Exception:
+            _local = ''
+        _msg = '确定删除该视频历史记录？'
+        if _local and os.path.exists(_local):
+            _msg = '确定删除该视频？\n将同时删除本地保存的文件：\n' + os.path.basename(_local)
+        elif getattr(self, '_video_local_paths', None):
+            _msg = '确定删除该视频历史记录？'
+        if not messagebox.askyesno('删除视频', _msg, icon='warning'):
+            return
+        # 1) 移除历史
+        try:
+            if url in self.video_history:
+                self.video_history.remove(url)
+        except Exception:
+            pass
+        # 2) 删除本地视频文件
+        _deleted = []
+        try:
+            if _local and os.path.exists(_local):
+                os.remove(_local)
+                _deleted.append(_local)
+        except Exception as e:
+            self.ctx.log('\n[系统日志] 删除本地视频失败: %s\n' % e)
+        # 3) 清理路径映射
+        try:
+            if hasattr(self, '_video_local_paths') and self._video_local_paths and url in self._video_local_paths:
+                self._video_local_paths.pop(url, None)
+        except Exception:
+            pass
+        # 4) 清理预览帧目录（项目/assets/video_previews/分镜N/）
+        try:
+            _pf = ''
+            try:
+                _pf = (getattr(self, '_video_preview_frames', {}) or {}).pop(url, '')
+            except Exception:
+                _pf = ''
+            if _pf and os.path.isdir(_pf):
+                import glob as _gl
+                for _ff in _gl.glob(os.path.join(_pf, '*.png')):
+                    try:
+                        os.remove(_ff)
+                    except Exception:
+                        pass
+                try:
+                    os.rmdir(_pf)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # 5) 删除对应尾帧（由本地文件名"分镜N_xxx.mp4"反推分镜号）
+        try:
+            if _local:
+                _bn = os.path.basename(_local)
+                _m = re.match(r'^分镜(\d+)', _bn)
+                if _m:
+                    _tf = os.path.join(self._tail_frames_dir(), "分镜%s.png" % _m.group(1))
+                    if os.path.exists(_tf):
+                        os.remove(_tf)
+                        _deleted.append(_tf)
+        except Exception:
+            pass
+        self._stop_video_preview()
+        self._update_video_history_ui()
+        self._show_toast('视频已删除' + ('（本地文件已删除）' if _deleted else ''), 'success')
+        # 保存项目（删除状态持久化）
+        try:
+            self._save_project()
+        except Exception:
+            pass
+
+    def _render_video_progress_marquee(self):
+        """2026-08-21 批量生成视频时：视频历史顶部显示跑马灯进度行（当前分镜/总数 + 动画）"""
+        try:
+            total = len(getattr(self, '_sb_batch_prompts', []) or [])
+            cur = getattr(self, '_sb_batch_index', 0)
+            # 清除旧的跑马灯
+            try:
+                if getattr(self, '_vid_marquee_lbl', None) is not None:
+                    self._vid_marquee_lbl.destroy()
+                    self._vid_marquee_lbl = None
+            except Exception:
+                pass
+            row = tk.Frame(self.frame_vid_history_inner, bg=COLOR_PANEL)
+            row.pack(fill='x', padx=4, pady=2, before=self.frame_vid_history_inner.winfo_children()[0] if self.frame_vid_history_inner.winfo_children() else None)
+            # 先移除 before 参数的重试：用 pack 顺序——插到最前
+            try:
+                row.pack_forget()
+                row.pack(fill='x', padx=4, pady=2, side='top')
+            except Exception:
+                row.pack(fill='x', padx=4, pady=2)
+            _done = getattr(self, '_story_batch_done', 0)
+            _fail = getattr(self, '_story_batch_fail_count', 0)
+            lbl = tk.Label(row, text='', font=('微软雅黑', 9, 'bold'), bg=COLOR_PANEL,
+                           fg=COLOR_ACCENT_DARK)
+            lbl.pack(side='left', padx=(0, 10))
+            self._vid_marquee_lbl = lbl
+            self._vid_marquee_frame = row
+            self._vid_marquee_step = 0
+            self._vid_marquee_after = None
+
+            def _tick():
+                try:
+                    if not getattr(self, '_sb_batch_in_progress', False):
+                        try:
+                            if self._vid_marquee_lbl is not None:
+                                self._vid_marquee_lbl.destroy()
+                            if self._vid_marquee_frame is not None:
+                                self._vid_marquee_frame.destroy()
+                            self._vid_marquee_lbl = None
+                            self._vid_marquee_frame = None
+                        except Exception:
+                            pass
+                        return
+                    cur2 = getattr(self, '_sb_batch_index', 0)
+                    done2 = getattr(self, '_story_batch_done', 0)
+                    fail2 = getattr(self, '_story_batch_fail_count', 0)
+                    step = getattr(self, '_vid_marquee_step', 0)
+                    dots = '.' * (step % 4)
+                    pct = int(done2 * 100.0 / total) if total else 0
+                    txt = ('⏳ 正在生成 分镜 %s/%s%s | 已完成 %s · 失败 %s (%d%%)'
+                           % (cur2, total, dots, done2, fail2, pct))
+                    self._vid_marquee_lbl.config(text=txt)
+                    self._vid_marquee_step = step + 1
+                    self._vid_marquee_after = self.root.after(500, _tick)
+                except Exception:
+                    pass
+            _tick()
+        except Exception:
+            pass
+
+    def _stop_video_progress_marquee(self):
+        """2026-08-21 停止跑马灯并移除"""
+        try:
+            if getattr(self, '_vid_marquee_after', None):
+                try:
+                    self.root.after_cancel(self._vid_marquee_after)
+                except Exception:
+                    pass
+                self._vid_marquee_after = None
+            if getattr(self, '_vid_marquee_lbl', None) is not None:
+                try:
+                    self._vid_marquee_lbl.destroy()
+                except Exception:
+                    pass
+                self._vid_marquee_lbl = None
+            if getattr(self, '_vid_marquee_frame', None) is not None:
+                try:
+                    self._vid_marquee_frame.destroy()
+                except Exception:
+                    pass
+                self._vid_marquee_frame = None
+        except Exception:
+            pass
+
+    # ============ 2026-08-21 视频 hover 预览（ffmpeg 抽帧 + PIL 循环，无 opencv）============
+    def _show_video_preview(self, url):
+        """鼠标悬停视频 → 弹固定尺寸小窗播放预览帧（PIL 循环）。优先本地已保存视频的预览帧。"""
+        try:
+            self._stop_video_preview()
+            if not url:
+                return
+            # ① 有正式本地文件（videos/ 目录已自动保存）
+            _formal = ''
+            try:
+                _formal = (getattr(self, '_video_local_paths', {}) or {}).get(url, '')
+                if _formal and not os.path.exists(_formal):
+                    _formal = ''
+            except Exception:
+                _formal = ''
+            if _formal:
+                # 预览帧已就绪 → 直接播放（秒开）
+                _frames = (getattr(self, '_video_preview_frames', {}) or {}).get(url, '')
+                if _frames and os.path.isdir(_frames):
+                    _fl = [f for f in os.listdir(_frames) if f.lower().endswith('.png')]
+                    if _fl:
+                        self._play_preview_frames(_frames)
+                        return
+                # 帧未就绪 → 显示"加载中"，后台抽帧
+                self._preview_hover_active = True
+                self._preview_win = tk.Toplevel(self.root)
+                self._preview_win.overrideredirect(True)
+                self._preview_win.attributes('-topmost', True)
+                self._preview_win.configure(bg='#111111')
+                self._preview_lbl = tk.Label(self._preview_win, text='⏳ 正在生成预览...', fg='white',
+                                             bg='#111111', font=('微软雅黑', 9), width=30, height=5)
+                self._preview_lbl.pack()
+                mx, my = self.root.winfo_pointerxy()
+                self._preview_win.geometry('+%d+%d' % (mx + 15, my + 15))
+                _sb = 0
+                try:
+                    _bn = os.path.basename(_formal)
+                    _m = re.match(r'^分镜(\d+)', _bn)
+                    if _m:
+                        _sb = int(_m.group(1))
+                except Exception:
+                    _sb = 0
+                threading.Thread(target=self._extract_preview_frames, args=(url, _formal, _sb), daemon=True).start()
+                return
+            # ② 无本地文件（罕见，理论上都已自动保存）→ 显示"加载中"并后台下载到临时缓存
+            self._preview_hover_active = True
+            self._preview_win = tk.Toplevel(self.root)
+            self._preview_win.overrideredirect(True)
+            self._preview_win.attributes('-topmost', True)
+            self._preview_win.configure(bg='#111111')
+            self._preview_lbl = tk.Label(self._preview_win, text='⏳ 加载预览中...', fg='white',
+                                         bg='#111111', font=('微软雅黑', 9), width=30, height=5)
+            self._preview_lbl.pack()
+            mx, my = self.root.winfo_pointerxy()
+            self._preview_win.geometry('+%d+%d' % (mx + 15, my + 15))
+            threading.Thread(target=self._download_video_for_preview, args=(url,), daemon=True).start()
+        except Exception:
+            pass
+
+    def _download_video_for_preview(self, url):
+        """兜底：无本地文件时下载到临时缓存并抽帧（正常流程不会走到这里）"""
+        try:
+            tmp_dir = os.path.join(os.environ.get('TEMP', os.getcwd()), 'CineMaster_Videos')
+            os.makedirs(tmp_dir, exist_ok=True)
+            tmp_path = os.path.join(tmp_dir, 'preview_' + str(int(time.time() * 1000)) + '.mp4')
+            resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=120, verify=False)
+            resp.raise_for_status()
+            with open(tmp_path, 'wb') as f:
+                f.write(resp.content)
+            _sb = int(time.time() * 1000) % 100000
+            self._extract_preview_frames(url, tmp_path, _sb)
+            # 抽帧后若鼠标仍悬停 → 播放（_extract_preview_frames 内部已处理）
+        except Exception:
+            try:
+                self._close_preview_win()
+            except Exception:
+                pass
+
+    def _play_preview_frames(self, frames_dir):
+        """用 PIL 循环播放预览帧（固定 360x202，主线程 after 切换，无后台线程）"""
+        try:
+            self._stop_video_preview()
+            if not frames_dir or not os.path.isdir(frames_dir):
+                return
+            _files = sorted([os.path.join(frames_dir, f) for f in os.listdir(frames_dir)
+                             if f.lower().endswith('.png')])
+            if not _files:
+                return
+            self._preview_hover_active = True
+            # 一次性加载所有帧到内存（24 张 360x202 ≈ 7MB，可接受）
+            _photos = []
+            for _f in _files:
+                try:
+                    _img = Image.open(_f).convert('RGB')
+                    _photos.append(ImageTk.PhotoImage(_img))
+                except Exception:
+                    pass
+            if not _photos:
+                return
+            win = tk.Toplevel(self.root)
+            win.overrideredirect(True)
+            win.attributes('-topmost', True)
+            win.configure(bg='#111111')
+            lbl = tk.Label(win, bg='#111111', borderwidth=0, highlightthickness=0)
+            lbl.pack()
+            mx, my = self.root.winfo_pointerxy()
+            # 固定尺寸窗口（帧本身 360x202，不随视频比例跳动）
+            win.geometry('360x202+%d+%d' % (mx + 15, my + 15))
+            self._preview_win = win
+            self._preview_lbl = lbl
+            self._preview_photos = _photos
+            self._preview_frame_idx = 0
+            self._preview_stop = False
+            self._preview_after = None
+            self._preview_tick()
+        except Exception:
+            pass
+
+    def _preview_tick(self):
+        """主线程定时切换预览帧（200ms/帧 ≈ 5fps）"""
+        try:
+            if getattr(self, '_preview_stop', False):
+                return
+            _photos = getattr(self, '_preview_photos', []) or []
+            if not _photos:
+                return
+            _idx = getattr(self, '_preview_frame_idx', 0) % len(_photos)
+            self._preview_frame_idx = _idx + 1
+            if getattr(self, '_preview_lbl', None) is not None:
+                self._preview_lbl.configure(image=_photos[_idx])
+                self._preview_lbl.image = _photos[_idx]
+            self._preview_after = self.root.after(200, self._preview_tick)
+        except Exception:
+            pass
+
+    def _stop_video_preview(self):
+        """停止预览并关闭窗口"""
+        try:
+            self._preview_stop = True
+            self._preview_hover_active = False
+            # 取消 after 定时器（PIL 帧循环用）
+            if getattr(self, '_preview_after', None) is not None:
+                try:
+                    self.root.after_cancel(self._preview_after)
+                except Exception:
+                    pass
+                self._preview_after = None
+        except Exception:
+            pass
+        try:
+            self._close_preview_win()
+        except Exception:
+            pass
+
+    def _close_preview_win(self):
+        try:
+            if getattr(self, '_preview_win', None) is not None:
+                try:
+                    self._preview_win.destroy()
+                except Exception:
+                    pass
+                self._preview_win = None
+        except Exception:
+            pass
 
     def _download_specific_video(self, url):
+        # 2026-08-21 优先本地已保存文件：直接复制（无需联网）
+        _local = ''
+        try:
+            _local = (getattr(self, '_video_local_paths', {}) or {}).get(url, '')
+            if _local and not os.path.exists(_local):
+                _local = ''
+        except Exception:
+            _local = ''
         path = filedialog.asksaveasfilename(defaultextension='.mp4',
                                             filetypes=[('MP4 视频', '*.mp4'), ('所有文件', '*.*')],
                                             title='保存视频')
         if not path:
             return
         try:
-            resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=120, verify=False)
-            with open(path, 'wb') as f:
-                f.write(resp.content)
+            if _local:
+                import shutil as _sh
+                _sh.copyfile(_local, path)
+            else:
+                resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=120, verify=False)
+                with open(path, 'wb') as f:
+                    f.write(resp.content)
             self._show_toast('视频已保存', 'success')
         except Exception as e:
             messagebox.showerror('下载失败', '错误详情: ' + str(e))
 
     def _play_specific_video(self, url):
+        # 2026-08-21 优先本地已保存文件：直接打开（无需下载）
+        _local = ''
+        try:
+            _local = (getattr(self, '_video_local_paths', {}) or {}).get(url, '')
+            if _local and not os.path.exists(_local):
+                _local = ''
+        except Exception:
+            _local = ''
+        if _local:
+            try:
+                if sys.platform == 'win32':
+                    os.startfile(_local)
+                elif sys.platform == 'darwin':
+                    import subprocess
+                    subprocess.Popen(['open', _local])
+                else:
+                    import subprocess
+                    subprocess.Popen(['xdg-open', _local])
+            except Exception as e:
+                messagebox.showerror('播放失败', '错误详情: ' + str(e))
+            return
         # 下载放到后台线程，避免阻塞界面
         def _worker():
             try:
-                tmp_dir = os.path.join(os.environ.get('TMPDIR', os.environ.get('TEMP', os.getcwd())), 'CineMaster_Videos')
+                tmp_dir = os.path.join(os.environ.get('TEMP', os.getcwd()), 'CineMaster_Videos')
                 os.makedirs(tmp_dir, exist_ok=True)
                 tmp_path = os.path.join(tmp_dir, 'video_' + str(int(time.time() * 1000)) + '.mp4')
                 resp = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=120, verify=False)
@@ -6912,6 +9478,54 @@ class CineMasterUI:
             'img_model': self.combo_img_model.get().strip(),
             'vid_model': self.combo_vid_model.get().strip(),
         }
+        # 2026-08-21 兜底：UI 控件为空时（供应商回填未生效/旧项目），
+        # 从 项目 vendors 或 config.json global_vendors 按角色 id 取文本/媒体供应商配置，
+        # 根治"生成第一步卡死（拿不到 API key）"问题。
+        try:
+            _tv = None
+            _mv = None
+            _tid = ''
+            _mid = ''
+            if self.current_project:
+                _tid = self.current_project.get("text_vendor_id") or ''
+                _mid = self.current_project.get("media_vendor_id") or ''
+                _pvs = self.current_project.get("vendors") or []
+                _tv = next((v for v in _pvs if v.get("id") == _tid), None)
+                _mv = next((v for v in _pvs if v.get("id") == _mid), None)
+            # 项目里没有 → 回退 config.json 全局供应商
+            if not _tv or not _mv:
+                _gv = (self.current_config or {}).get("global_vendors") or []
+                if isinstance(_gv, list):
+                    if not _tv:
+                        _tid2 = _tid or (self.current_config or {}).get("global_text_vendor_id") or ''
+                        _tv = next((v for v in _gv if v.get("id") == _tid2), None)
+                    if not _mv:
+                        _mid2 = _mid or (self.current_config or {}).get("global_media_vendor_id") or ''
+                        _mv = next((v for v in _gv if v.get("id") == _mid2), None)
+            # 文本供应商回填
+            if _tv and not cfg.get('api_key'):
+                cfg['api_key'] = (_tv.get("api_key") or '').strip()
+            if _tv and not cfg.get('base_url'):
+                cfg['base_url'] = (_tv.get("base_url") or '').strip()
+            if _tv and not cfg.get('model_name'):
+                _tm = next((m for m in _tv.get("models", []) if m.get("type") == "text"), None)
+                if _tm:
+                    cfg['model_name'] = (_tm.get("name") or '').strip()
+            # 媒体供应商回填
+            if _mv:
+                if not cfg.get('media_api_key'):
+                    cfg['media_api_key'] = (_mv.get("api_key") or '').strip()
+                if not cfg.get('media_base_url'):
+                    cfg['media_base_url'] = (_mv.get("base_url") or '').strip()
+                _img_m = next((m for m in _mv.get("models", []) if m.get("type") == "image"), None)
+                _vid_m = next((m for m in _mv.get("models", []) if m.get("type") == "video"), None)
+                if not cfg.get('img_model') and _img_m:
+                    cfg['img_model'] = (_img_m.get("name") or '').strip()
+                if not cfg.get('vid_model') and _vid_m:
+                    cfg['vid_model'] = (_vid_m.get("name") or '').strip()
+                cfg['media_vendor_type'] = (_mv.get("type") or '')
+        except Exception:
+            pass
         # 显式供应商类型标记（comfyui / openai / 其他），供生成模块路由判断
         mv = None
         if self.current_project:
@@ -6973,7 +9587,7 @@ def main():
     import tkinter as tk
     import traceback as _tb
     import os as _os
-    _LOG = _os.path.join(_os.environ.get('TMPDIR', os.environ.get('TEMP', '.')), 'wave_license_debug.log')
+    _LOG = _os.path.join(_os.environ.get('TEMP', '.'), 'wave_license_debug.log')
     def _log(msg):
         try:
             with open(_LOG, 'a', encoding='utf-8') as _f:
@@ -7007,6 +9621,54 @@ def main():
             _log('root.after 已注册')
     except Exception:
         _log('激活检查异常: %s' % _tb.format_exc())
+    # 本地控制接口（OpenClaw/QQ 机器人遥控，2026-08-20 新增；端口可在 config.json 的 control_port 覆盖）
+    try:
+        if ControlServer is not None:
+            _port = 8712
+            try:
+                _cfg = load_config()
+                _port = int((_cfg or {}).get('control_port', 8712) or 8712)
+            except Exception:
+                pass
+            _cs = ControlServer(app, port=_port)
+            if _cs.start():
+                app._ctrl_port = _port
+                app.ctrl_server = _cs
+                _log('控制接口已启动: http://127.0.0.1:%d' % _port)
+            else:
+                _log('控制接口启动失败（端口 %d 可能被占用）' % _port)
+    except Exception:
+        _log('控制接口启动异常: %s' % _tb.format_exc())
+    # QQ 机器人桥接（进程内模式，2026-08-20 新增；未启用/未配置时跳过，不影响主程序）
+    try:
+        _qq_cfg2 = (load_config() or {}).get('qq_bot', {}) or {}
+        if _qq_cfg2.get('enabled') and _qq_cfg2.get('appid'):
+            # 若配置了 MiniMax key，先初始化 OpenClaw（客户自己的 key）
+            try:
+                _adl_cfg2 = (load_config() or {}).get('autodl', {}) or {}
+                _mm_key = (_adl_cfg2 or {}).get('minimax_key', '')
+                if _mm_key:
+                    from openclaw_launcher import setup_openclaw, start_gateway
+                    _ok, _msg = setup_openclaw(_mm_key)
+                    _log('OpenClaw 配置: %s' % _msg)
+                    if _ok:
+                        start_gateway(_mm_key)
+                        _log('OpenClaw gateway 已启动')
+            except Exception:
+                _log('OpenClaw 初始化异常: %s' % _tb.format_exc())
+            from qq_bridge import run_bot_internal
+            threading.Thread(target=run_bot_internal, args=(_qq_cfg2, app), daemon=True).start()
+            _log('QQ 机器人桥接已启动')
+        else:
+            _log('QQ 机器人未启用（配置页「AI 遥控」可开启）')
+    except Exception:
+        _log('QQ 桥接启动异常: %s' % _tb.format_exc())
+    # 2026-08-21 需求2：批量生成按钮 3 分钟超时自动恢复看门狗
+    try:
+        app._start_btn_timeout_watch()
+        _log('按钮超时看门狗已启动')
+    except Exception:
+        pass
     root.mainloop()
     return app
 
