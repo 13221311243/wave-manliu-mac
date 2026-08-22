@@ -91,6 +91,19 @@ class LLMSkill(BaseSkill):
                         break
                     except Exception as conn_err:
                         err_str = str(conn_err).lower()
+                        # 2026-08-22 断点续跑：401/402/余额不足/认证失败 = 账户问题，不重试、
+                        # 立即中断并通知 UI 写断点（客户充值后可点「继续上次任务」续跑，不用从头开始）
+                        _acct_issue = ('401' in err_str or '402' in err_str
+                                       or 'insufficient' in err_str or 'balance' in err_str
+                                       or 'quota' in err_str or 'authentication' in err_str
+                                       or 'unauthorized' in err_str or 'invalid api key' in err_str
+                                       or '余额' in err_str or '欠费' in err_str or '计费' in err_str)
+                        if _acct_issue:
+                            self.ctx.log('\n\n[系统日志: 账户问题（余额不足/认证失败），任务已暂停。'
+                                         '充值/修复后点「🔄 继续上次任务」即可续跑，无需从头开始。] 错误：%s\n'
+                                         % str(conn_err)[:300])
+                            self.ctx.push_ui_event('llm_interrupted', {'reason': 'account', 'error': str(conn_err)[:300]})
+                            raise conn_err
                         is_disconnect = ('incomplete chunked read' in err_str
                                          or 'peer closed' in err_str
                                          or 'connection reset' in err_str)

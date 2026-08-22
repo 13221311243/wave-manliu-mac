@@ -32,7 +32,6 @@ except Exception:
     EditStudio = None
 
 # 2026-08-21 敏感常量从 PyArmor 加密模块导入（SYSTEM_PROMPT/VIDEO_STYLE_PRESETS/GENRE_DIRECTOR_SKILLS）
-# ⚠️ 必须放在所有 try 块之外（曾插入 try 块中间导致 SyntaxError: expected 'except' or 'finally'）
 from skills.protected_data import SYSTEM_PROMPT, VIDEO_STYLE_PRESETS
 from skills.protected_genres_a import GENRE_DIRECTOR_SKILLS as _GDA
 from skills.protected_genres_b import GENRE_DIRECTOR_SKILLS as _GDB
@@ -501,6 +500,10 @@ class CineMasterUI:
         self._gen_review_text = ''       # 上一轮评级意见（重新生成携带）
         self._stage_review_done = set()  # 2026-08-21 已触发评级的阶段标记集合（防重复评级）
         self._pending_stage_after = None # 2026-08-21 挂起的阶段评级 after 回调 id（确认后取消）
+        # 2026-08-22 断点续跑：LLM 任务中断（欠费/网络/异常）后可从断点继续
+        self._resume_mode = False        # 恢复模式：续跑时不清空 tab、注入已生成内容
+        self._resume_save_after = None   # 流式实时存档防抖 after id（1.5s）
+        self._resume_save_pending = False
         self._asset_photo_refs = {}       # 缩略图 PhotoImage 引用防GC
         self._asset_checked = {}          # {资产名: bool} 勾选状态
         self._regenerating_asset = None   # 正在重新生成的资产名
@@ -1193,6 +1196,12 @@ class CineMasterUI:
         # 打开项目后自动同步分镜提示词到视频 Tab
         try:
             self.root.after(600, self._safe_sync_storyboard)
+        except Exception:
+            pass
+        # 2026-08-22 断点续跑：打开项目后刷新「继续上次任务」按钮（有断点才亮）
+        try:
+            self._resume_mode = False
+            self._update_resume_btn()
         except Exception:
             pass
         self._show_toast("已打开项目：" + data.get("name", ""), "success")
@@ -2580,6 +2589,13 @@ class CineMasterUI:
                                           command=self._clear_all_assets)
         self.btn_clear_assets.pack(side="left", padx=(8, 0))
         bind_hover(self.btn_clear_assets, "#8E8E93", "#6E6E73")
+        # 2026-08-22 断点续跑：LLM 任务中断（欠费等）后从断点继续
+        self.btn_resume = tk.Button(frame, text="🔄 继续上次任务", font=FONT_TITLE, bg="#7A5AF8",
+                                    fg="white", relief="flat", padx=16, pady=2, state=tk.DISABLED,
+                                    activebackground="#5B3FD4", activeforeground="white",
+                                    command=self._resume_last_task)
+        self.btn_resume.pack(side="left", padx=(8, 0))
+        bind_hover(self.btn_resume, "#7A5AF8", "#5B3FD4")
         self.btn_stop = tk.Button(frame, text="■ 停止生成", font=FONT_TITLE, bg="#D63027", fg="white",
                                   relief="flat", padx=16, pady=2, state=tk.DISABLED,
                                   activebackground="#A82820", activeforeground="white",
@@ -6742,6 +6758,18 @@ class CineMasterUI:
                     self._append_text('all', edata.get('text', ''))
                 elif event_type == 'stream':
                     self._handle_stream(edata.get('text', ''))
+                    # 2026-08-22 断点续跑：流式内容实时存档（1.5s 防抖，中断时最多丢尾部1.5秒）
+                    try:
+                        self._schedule_resume_save()
+                    except Exception:
+                        pass
+                elif event_type == 'llm_interrupted':
+                    # 2026-08-22 断点续跑：LLM 账户问题（欠费/认证失败）中断 → 写断点 + 提示
+                    try:
+                        self._on_llm_interrupted(reason=edata.get('reason', '中断'),
+                                                 error=edata.get('error', ''))
+                    except Exception:
+                        pass
                 elif event_type == 'image_done':
                     self._handle_image_done(edata.get('url', ''), edata.get('name', ''),
                                             edata.get('type', ''))
@@ -7078,7 +7106,15 @@ class CineMasterUI:
             import subprocess as _sp
             import glob
             _ff = imageio_ffmpeg.get_ffmpeg_exe()
-            _previews = os.path.join(self._preview_frames_dir(), "分镜%d" % sb_num)
+            # 2026-08-22 修复：预览帧目录改用 url 哈希命名（v_<md5前12位>），
+            # 不再用分镜号——分镜号会被重复生成/失败计数错位导致多个视频共用同一目录互相覆盖，
+            # 症状：视频生成多了以后 hover 预览全变成同一个视频。
+            # 一视频一目录，永不覆盖；_video_preview_frames[url] 映射不变。
+            try:
+                _uid = hashlib.md5(url.encode('utf-8', 'ignore')).hexdigest()[:12]
+            except Exception:
+                _uid = str(abs(hash(url)) % (10 ** 10))
+            _previews = os.path.join(self._preview_frames_dir(), "v_" + _uid)
             os.makedirs(_previews, exist_ok=True)
             # 清掉旧帧（重新生成时覆盖）
             for _old in glob.glob(os.path.join(_previews, 'f_*.png')):
@@ -7213,6 +7249,17 @@ class CineMasterUI:
         self.line_buffer = ''
         self.current_section = 'script'
         self._story_gen_done = False  # 重置转化完成标记（新一轮生成重新检测）
+        # 2026-08-22 断点续跑：新任务开始 → 非恢复模式 + 写入断点 stage=1 + 按钮变灰
+        self._resume_mode = False
+        try:
+            self._write_resume_state(active=True, stage=1, interrupted='',
+                                     markers=[], episode=int((self.current_project or {}).get('episode', 0) or 0))
+        except Exception:
+            pass
+        try:
+            self._update_resume_btn()
+        except Exception:
+            pass
         # 开始新转化时清空分镜提示词列表（生成完成后自动同步）
         self.storyboard_prompts = []
         self.story_prompt_vars = []
@@ -7365,6 +7412,13 @@ class CineMasterUI:
             # 生成线程已结束，先确保按钮状态正确（btn_generate 保持可用）
             self.progress_bar.stop()
             self.btn_stop.config(state=tk.DISABLED)
+            # 2026-08-22 断点续跑：阶段完成标记 → 更新断点（中断后从下一阶段续跑）
+            try:
+                self._write_resume_state(active=True, stage=2 if marker == '[STAGE1_DONE]' else 3,
+                                         interrupted='',
+                                         markers=list(getattr(self, '_stage_review_done', set())))
+            except Exception:
+                pass
             if marker == '[STAGE1_DONE]':
                 self._gen_stage = 1
                 self._trigger_review('script')
@@ -7688,11 +7742,13 @@ class CineMasterUI:
             # 阶段①通过 → 阶段②（资产清单）
             self._stage_review_done.add('[STAGE1_DONE]')
             self._gen_review_text = ''
+            self._resume_mode = False  # 2026-08-22 断点续跑：阶段切换后恢复正常流程
             self._run_stage2()
         elif review_type == 'storyboard':
             # 阶段②通过 → 阶段③（剪辑方案）
             self._stage_review_done.add('[STAGE2_DONE]')
             self._gen_review_text = ''
+            self._resume_mode = False  # 2026-08-22 断点续跑：阶段切换后恢复正常流程
             self._run_stage3()
 
     def _on_review_regen(self, review_type, report, win):
@@ -7740,7 +7796,7 @@ class CineMasterUI:
             # 2026-08-21 分镜指令重生成 → 重跑分镜段（②B），资产保留
             self._run_stage2b(regen=True)
 
-    def _run_stage1(self, regen=False):
+    def _run_stage1(self, regen=False, resume=False):
         """阶段①：剧本生成（A基础角色+B剧本正文）→ [STAGE1_DONE]"""
         try:
             self.ctx.stop_flag = False
@@ -7748,6 +7804,12 @@ class CineMasterUI:
             self.btn_stop.config(state=tk.NORMAL)
             self.progress_bar.start()
             self._gen_stage = 1
+            # 2026-08-22 断点续跑：写入断点（中断后可从阶段1继续）
+            try:
+                self._write_resume_state(active=True, stage=1, interrupted='',
+                                         markers=list(getattr(self, '_stage_review_done', set())))
+            except Exception:
+                pass
             # 2026-08-21 重新生成时清空对应阶段 tab（避免内容追加到旧文本后）
             if regen:
                 # 允许重新评级
@@ -7770,6 +7832,11 @@ class CineMasterUI:
                           + self._gen_review_text[:4000] +
                           '\n\n注意：只输出【剧本信息】【A. 剧本基础角色资产】【B. 剧本正文】，'
                           '输出完毕后输出 [STAGE1_DONE]')
+            # 2026-08-22 断点续跑：注入已生成内容（LLM 接着写，不重复）
+            if resume:
+                _tail = self._resume_context_tail()
+                if _tail:
+                    _extra = (_extra + '\n' if _extra else '') + _tail
             self.agent.generate_storyboard(self._gen_novel_text,
                                            self._gen_command_text,
                                            self._get_api_config(), self._gen_system_prompt,
@@ -7778,7 +7845,7 @@ class CineMasterUI:
         except Exception as e:
             self.ctx.log('\n[系统日志] 阶段①生成启动异常: %s\n' % e)
 
-    def _run_stage2(self, regen=False):
+    def _run_stage2(self, regen=False, resume=False):
         """阶段②A：全资产(C/D/E) 生成 → [ASSETS_DONE]，等用户确认资产清单后再出分镜"""
         try:
             self.ctx.stop_flag = False
@@ -7786,6 +7853,12 @@ class CineMasterUI:
             self.btn_stop.config(state=tk.NORMAL)
             self.progress_bar.start()
             self._gen_stage = 2
+            # 2026-08-22 断点续跑：写入断点（中断后可从阶段2资产段继续）
+            try:
+                self._write_resume_state(active=True, stage=2, interrupted='',
+                                         markers=list(getattr(self, '_stage_review_done', set())))
+            except Exception:
+                pass
             # 2026-08-21 重新生成时清空对应阶段 tab（资产；保留剧本 script/all 不清）
             if regen:
                 # 允许重新确认资产
@@ -7827,6 +7900,11 @@ class CineMasterUI:
             if regen and self._gen_review_text:
                 _extra += ('\n\n上一版资产清单需调整，请根据以下要求修改后重新输出完整资产卡：\n'
                            + self._gen_review_text[:4000])
+            # 2026-08-22 断点续跑：注入已生成内容（LLM 接着写，不重复）
+            if resume:
+                _tail = self._resume_context_tail()
+                if _tail:
+                    _extra += _tail
             self.agent.generate_storyboard(self._gen_novel_text,
                                            self._gen_command_text,
                                            self._get_api_config(), self._gen_system_prompt,
@@ -7835,7 +7913,7 @@ class CineMasterUI:
         except Exception as e:
             self.ctx.log('\n[系统日志] 阶段②A 资产生成启动异常: %s\n' % e)
 
-    def _run_stage2b(self, regen=False):
+    def _run_stage2b(self, regen=False, resume=False):
         """阶段②B：分镜全局规划 + F段分镜资产 → [STAGE2_DONE]，之后评级"""
         try:
             self.ctx.stop_flag = False
@@ -7843,6 +7921,12 @@ class CineMasterUI:
             self.btn_stop.config(state=tk.NORMAL)
             self.progress_bar.start()
             self._gen_stage = 2
+            # 2026-08-22 断点续跑：写入断点（中断后可从阶段2分镜段继续）
+            try:
+                self._write_resume_state(active=True, stage=2, interrupted='',
+                                         markers=list(getattr(self, '_stage_review_done', set())))
+            except Exception:
+                pass
             # 2026-08-21 重新生成时清空分镜 tab（资产保留）
             if regen:
                 # 允许重新评级分镜
@@ -7881,6 +7965,11 @@ class CineMasterUI:
             if regen and self._gen_review_text:
                 _extra += ('\n\n上一版分镜评级未通过，请根据以下评级意见针对性修改后重新输出完整内容：\n'
                            + self._gen_review_text[:4000])
+            # 2026-08-22 断点续跑：注入已生成内容（LLM 接着写，不重复）
+            if resume:
+                _tail = self._resume_context_tail()
+                if _tail:
+                    _extra += _tail
             self.agent.generate_storyboard(self._gen_novel_text,
                                            self._gen_command_text,
                                            self._get_api_config(), self._gen_system_prompt,
@@ -7905,6 +7994,12 @@ class CineMasterUI:
                 pass
             self.progress_bar.stop()
             self.btn_stop.config(state=tk.DISABLED)
+            # 2026-08-22 断点续跑：资产完成 → 断点标记 ASSETS_DONE（中断后确认过资产则从分镜段续跑）
+            try:
+                self._write_resume_state(active=True, stage=2, interrupted='',
+                                         markers=list(getattr(self, '_stage_review_done', set())))
+            except Exception:
+                pass
             self.label_gen_time.config(text='资产清单已生成，等待确认')
             self.ctx.log('\n[系统日志] 资产清单已生成，等待用户确认...\n')
             self._show_assets_confirm_dialog()
@@ -8104,6 +8199,7 @@ class CineMasterUI:
             pass
         self.ctx.log('\n[系统日志] 资产清单已确认，开始生成分镜...\n')
         self._gen_review_text = ''
+        self._resume_mode = False  # 2026-08-22 断点续跑：阶段切换后恢复正常流程
         self._run_stage2b()
 
     def _on_assets_supplement(self, win):
@@ -8126,7 +8222,7 @@ class CineMasterUI:
             self._gen_review_text = '请重新生成资产清单，确保剧本中所有角色、场景、道具都有对应资产卡。'
         self._run_stage2(regen=True)
 
-    def _run_stage3(self):
+    def _run_stage3(self, resume=False):
         """阶段③：剪映剪辑指导方案(G) → [ALL_DONE] 全部完成"""
         try:
             self.ctx.stop_flag = False
@@ -8134,8 +8230,19 @@ class CineMasterUI:
             self.btn_stop.config(state=tk.NORMAL)
             self.progress_bar.start()
             self._gen_stage = 3
+            # 2026-08-22 断点续跑：写入断点（中断后可从阶段3继续）
+            try:
+                self._write_resume_state(active=True, stage=3, interrupted='',
+                                         markers=list(getattr(self, '_stage_review_done', set())))
+            except Exception:
+                pass
             _extra = ('分镜已通过评级确认。现在开始第三阶段（最后一段）：'
                       '输出【剪映专业剪辑指导方案】（G段），输出完毕后输出 [ALL_DONE]')
+            # 2026-08-22 断点续跑：注入已生成内容（LLM 接着写，不重复）
+            if resume:
+                _tail = self._resume_context_tail()
+                if _tail:
+                    _extra += _tail
             self.agent.generate_storyboard(self._gen_novel_text,
                                            self._gen_command_text,
                                            self._get_api_config(), self._gen_system_prompt,
@@ -8163,12 +8270,180 @@ class CineMasterUI:
                     pass
                 self.ctx.log('[系统日志] ✅ 第 %d 集全链路完成，集数记录已推进（下次勾选「续写下一集」将自动生成第 %d 集）\n'
                              % (_target, _target + 1))
+            # 2026-08-22 断点续跑：全集链路完成 → 清断点 + 恢复按钮变灰
+            try:
+                self._resume_mode = False
+                self._clear_resume_state()
+                self._update_resume_btn()
+            except Exception:
+                pass
         except Exception as e:
             self.ctx.log('[系统日志] 集数推进异常: %s\n' % e)
 
     def _on_stop_click(self):
         self.ctx.stop_flag = True
         self.ctx.log('[系统日志] 用户已停止生成。\n')
+
+    # ============ 2026-08-22 断点续跑（LLM 任务中断后继续） ============
+
+    def _resume_state(self):
+        """读取当前项目断点状态（无项目/无字段 → 默认不活跃）"""
+        try:
+            if self.current_project:
+                st = self.current_project.get('resume_state') or {}
+                if isinstance(st, dict) and st.get('active'):
+                    return st
+        except Exception:
+            pass
+        return None
+
+    def _write_resume_state(self, active=True, stage=None, markers=None, interrupted='', episode=None):
+        """写断点状态到当前项目（随项目保存/加载，跨会话有效）"""
+        try:
+            if not self.current_project:
+                return
+            _st = dict(self.current_project.get('resume_state') or {})
+            _st['active'] = bool(active)
+            if stage is not None:
+                _st['stage'] = stage
+            if markers is not None:
+                # 兼容 list（阶段标记集合）和 dict 两种输入
+                if isinstance(markers, (list, tuple, set)):
+                    _st['markers'] = sorted(str(m) for m in markers)
+                else:
+                    _st['markers'] = dict(markers)
+            if interrupted is not None:
+                _st['interrupted'] = interrupted
+            if episode is not None:
+                _st['episode'] = episode
+            _st['updated'] = time.strftime('%Y-%m-%d %H:%M:%S')
+            self.current_project['resume_state'] = _st
+            try:
+                self._auto_save_project()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _clear_resume_state(self):
+        """任务全部完成/用户从头开始 → 清断点"""
+        try:
+            if self.current_project:
+                self.current_project['resume_state'] = {'active': False, 'updated': time.strftime('%Y-%m-%d %H:%M:%S')}
+                try:
+                    self._auto_save_project()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _schedule_resume_save(self):
+        """流式内容实时存档：每 1.5 秒静默保存一次（欠费/崩溃中断时最多丢 1.5 秒尾部内容）"""
+        try:
+            self._resume_save_pending = True
+            if self._resume_save_after is None:
+                self._resume_save_after = self.root.after(1500, self._flush_resume_save)
+        except Exception:
+            pass
+
+    def _flush_resume_save(self):
+        """执行实时存档 + 更新断点内容"""
+        try:
+            self._resume_save_after = None
+            if self._resume_save_pending:
+                self._resume_save_pending = False
+                try:
+                    self._auto_save_project()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _on_llm_interrupted(self, reason='', error=''):
+        """LLM 任务中断（账户问题等）→ 写断点 + 恢复按钮点亮 + 提示用户"""
+        try:
+            self.progress_bar.stop()
+            self.btn_generate.config(state=tk.NORMAL)
+            self.btn_stop.config(state=tk.DISABLED)
+            _msg = 'LLM 任务已暂停（账户问题：余额不足或认证失败）。\n充值/修复后点「🔄 继续上次任务」即可续跑，无需从头开始。'
+            if error:
+                _msg += '\n\n错误：' + str(error)[:200]
+            self.ctx.log('\n[系统日志] 任务已暂停（%s）。已保存断点，可点「继续上次任务」续跑。\n' % (reason or '中断'))
+            self._write_resume_state(active=True, interrupted=reason or '中断', markers=list(getattr(self, '_stage_review_done', set())))
+            try:
+                self._update_resume_btn()
+            except Exception:
+                pass
+            self._show_toast('⚠️ ' + _msg, 'warning')
+        except Exception:
+            pass
+
+    def _update_resume_btn(self):
+        """刷新「继续上次任务」按钮状态（有断点才亮）"""
+        try:
+            if not hasattr(self, 'btn_resume'):
+                return
+            _has = self._resume_state() is not None and not getattr(self, '_resume_mode', False)
+            try:
+                self.btn_resume.config(state=tk.NORMAL if _has else tk.DISABLED)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _resume_last_task(self):
+        """「🔄 继续上次任务」：读断点 → 从断点阶段续跑（不清空 tab、注入已生成内容）"""
+        try:
+            _st = self._resume_state()
+            if not _st:
+                self._show_toast('没有可继续的任务', 'info')
+                return
+            if getattr(self, '_sb_batch_in_progress', False) or self._gen_in_progress():
+                self._show_toast('有任务正在运行，请先停止', 'warning')
+                return
+            _stage = int(_st.get('stage', 1) or 1)
+            _ep = int(_st.get('episode', 0) or 0)
+            _episode_target = _ep if _ep >= 1 else 1
+            self._continue_episode_target = _episode_target
+            # 恢复模式：不清空 tab、注入已生成内容
+            self._resume_mode = True
+            self.ctx.stop_flag = False
+            self.ctx.log('\n[系统日志] 🔄 继续上次任务：从阶段 %d 续跑（内容已保留，LLM 将接着写）\n' % _stage)
+            if _stage >= 3:
+                self._run_stage3(resume=True)
+            elif _stage == 2:
+                # 判断是资产段还是分镜段：看 markers 是否已有 ASSETS_DONE
+                _mk = set(_st.get('markers') or [])
+                if '[ASSETS_DONE]' in _mk:
+                    self._run_stage2b(resume=True)
+                else:
+                    self._run_stage2(resume=True)
+            else:
+                self._run_stage1(resume=True)
+        except Exception as e:
+            self.ctx.log('\n[系统日志] 继续任务启动异常: %s\n' % e)
+            self._show_toast('继续任务失败: %s' % e, 'error')
+
+    def _resume_context_tail(self):
+        """恢复模式的续写上下文：从各 tab 取已生成内容尾部（LLM 无记忆，需注入它自己写过的内容）"""
+        _parts = []
+        for _k in ('script', 'character', 'scene', 'prop', 'global_plan', 'storyboard', 'editing'):
+            try:
+                _w = self.text_widgets.get(_k)
+                if _w is not None:
+                    _t = _w.get('1.0', tk.END).strip()
+                    if _t:
+                        _parts.append('【%s 已生成内容】\n%s' % (_k, _t[-4000:]))
+            except Exception:
+                pass
+        if not _parts:
+            return ''
+        return ('\n\n【断点续写上下文 · 非常重要】\n'
+                '以下是本任务此前已生成的内容（你之前的输出）。你必须：\n'
+                '1. 严格接着这些内容的【末尾】继续输出，严禁从头开始、严禁重复或改写已生成内容；\n'
+                '2. 保持格式、风格、人物、剧情与已生成内容完全一致；\n'
+                '3. 输出你尚未完成的部分，直到本阶段结束标记。\n'
+                '----------\n' + '\n\n'.join(_parts) + '\n----------')
 
     # ============ 清除资产 ============
     def _clear_all_assets(self):
@@ -8193,6 +8468,13 @@ class CineMasterUI:
         try:
             if self.current_project:
                 self.current_project['episode'] = 0
+        except Exception:
+            pass
+        # 2026-08-22 断点续跑：清除资产=从头开始 → 清断点 + 恢复按钮变灰
+        try:
+            self._resume_mode = False
+            self._clear_resume_state()
+            self._update_resume_btn()
         except Exception:
             pass
         self.image_history = []
