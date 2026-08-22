@@ -42,7 +42,19 @@ GENRE_DIRECTOR_SKILLS.update(_GDB)
 APP_NAME = "wave漫流"
 APP_SUBTITLE = "| AI 影视工业级分镜引擎"
 CONFIG_FILE = "config.json"
-PROJECTS_DIR = "projects"
+# 2026-08-22 Mac 版数据目录固定到用户 Application Support（Finder 启动 .app 时工作目录不定，
+# 相对路径 projects/ 会导致用户找不到生成内容）。Windows 保持原相对路径（D:\wave 运行位）。
+if sys.platform == 'darwin':
+    try:
+        _base_dir = os.path.join(os.path.expanduser('~'), 'Library', 'Application Support', 'wave漫流')
+        os.makedirs(_base_dir, exist_ok=True)
+        PROJECTS_DIR = os.path.join(_base_dir, 'projects')
+        CONFIG_FILE = os.path.join(_base_dir, 'config.json')
+    except Exception:
+        PROJECTS_DIR = "projects"
+        CONFIG_FILE = "config.json"
+else:
+    PROJECTS_DIR = "projects"
 VENDOR_TEMPLATES_FILE = "vendor_templates.json"
 
 # ================= 配色方案（偏好设置，参考 Toonflow/tdesign 主题色） =================
@@ -231,10 +243,15 @@ def dialect_lang_instruction(lang_name):
         return ""
 
 
-FONT_TITLE = ("微软雅黑", 12, "bold")
-FONT_MAIN = ("微软雅黑", 10)
-FONT_CODE = ("Consolas", 10)
-
+# 2026-08-22 跨平台字体：macOS 无微软雅黑/Consolas → 用 PingFang SC/Menlo（tkinter 找不到会回退系统字体）
+if sys.platform == 'darwin':
+    FONT_TITLE = ("PingFang SC", 12, "bold")
+    FONT_MAIN = ("PingFang SC", 10)
+    FONT_CODE = ("Menlo", 10)
+else:
+    FONT_TITLE = ("微软雅黑", 12, "bold")
+    FONT_MAIN = ("微软雅黑", 10)
+    FONT_CODE = ("Consolas", 10)
 
 # ================= Toonflow 导演技法集成（桌面4文件夹） =================
 # 12 种题材导演手法（源自 Toonflow skill 体系），用于生成分镜时注入题材叙事技法
@@ -300,7 +317,6 @@ REVIEW_STORYBOARD_DIMENSIONS = """# 分镜（C/D/E资产 + 分镜全局规划 + 
     ④ 视线/手势/道具指向歧义：视线落点、手指方向、道具朝向（刀尖/枪口/信纸）必须写明指向画面何处或哪个角色（如"刀尖朝上指向画面右上方"），禁止"指向那边/朝向他"等含糊表述；
     ⑤ 时间轴动作顺序歧义：同一时间段内多个动作是否明确先后（"先…再…然后…"）；是否出现"同时"与"先后"混用、动作与台词时序矛盾（台词说完前动作已完成）；
     ⑥ 其他矛盾：同一分镜内互相冲突的约束（正反描述并存，如"缓慢"与"急速"、"安静"与"喧哗"）、同一角色同一镜内位置跳变、可被 H3 多种解读的模糊描述。"""
-
 
 
 # 视觉连续性铁律（源自 Toonflow 分镜表技法：保证相邻分镜衔接不跳画面、不穿帮）

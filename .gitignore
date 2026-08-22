@@ -12,3 +12,4 @@ app.icns
 # macOS
 .DS_Store
 mac_artifact_latest.zip
+ui/app_ui.py.bak_20260822
